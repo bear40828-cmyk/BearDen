@@ -4214,6 +4214,57 @@ private struct WorkspaceWebsiteIcon: View {
     }
 }
 
+/// Reports how far a scroll view is pulled past one edge, but only for a drag that began
+/// with the content already resting at that edge. Scrolling into the edge (momentum, or the
+/// same finger still moving) never counts, so the list behaves normally until the user stops
+/// at the edge and then deliberately pulls further.
+private struct ScrollEdgePullTracker: ViewModifier {
+    enum Edge { case top, bottom }
+    let edge: Edge
+    let enabled: Bool
+    let onPull: (CGFloat) -> Void
+    let onRelease: (CGFloat) -> Void
+
+    @State private var eligible = false
+    @State private var interacting = false
+    @State private var overscroll: CGFloat = 0
+
+    @available(iOS 18.0, *)
+    private func edgeOverscroll(_ g: ScrollGeometry) -> CGFloat {
+        switch edge {
+        case .top:
+            return -(g.contentOffset.y + g.contentInsets.top)
+        case .bottom:
+            let maxOffset = max(g.contentSize.height + g.contentInsets.top + g.contentInsets.bottom - g.containerSize.height, 0)
+            return g.contentOffset.y + g.contentInsets.top - maxOffset
+        }
+    }
+
+    func body(content: Content) -> some View {
+        if #available(iOS 18.0, *) {
+            content
+                .onScrollPhaseChange { old, new, context in
+                    if new == .interacting {
+                        interacting = true
+                        // Must start from rest (not mid-momentum) with the content at the edge.
+                        eligible = enabled && old == .idle && abs(edgeOverscroll(context.geometry)) <= 1
+                    } else if interacting {
+                        interacting = false
+                        if eligible { onRelease(max(overscroll, 0)) }
+                        eligible = false
+                    }
+                }
+                .onScrollGeometryChange(for: CGFloat.self, of: { edgeOverscroll($0) }) { _, value in
+                    overscroll = value
+                    guard interacting, eligible else { return }
+                    onPull(max(value, 0))
+                }
+        } else {
+            content
+        }
+    }
+}
+
 private struct ConversationScrollOffsetKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
@@ -4304,6 +4355,13 @@ private struct WorkspaceLauncherView: View {
                 .padding(.top, 44)
             }
             .scrollIndicators(.hidden)
+            .scrollBounceBehavior(.always)
+            .modifier(ScrollEdgePullTracker(
+                edge: .bottom,
+                enabled: true,
+                onPull: onCloseDragChanged,
+                onRelease: { onCloseDragEnded($0, $0) }
+            ))
 
             VStack {
                 Spacer()
@@ -4325,21 +4383,6 @@ private struct WorkspaceLauncherView: View {
                 .padding(.bottom, 8)
             }
         }
-        .contentShape(Rectangle())
-        .simultaneousGesture(
-            DragGesture(minimumDistance: 12, coordinateSpace: .global)
-                .onChanged { value in
-                    guard value.translation.height < 0,
-                          abs(value.translation.height) > abs(value.translation.width) else { return }
-                    onCloseDragChanged(-value.translation.height)
-                }
-                .onEnded { value in
-                    onCloseDragEnded(
-                        max(0, -value.translation.height),
-                        max(0, -value.predictedEndTranslation.height)
-                    )
-                }
-        )
     }
 
     @ViewBuilder
@@ -4625,13 +4668,6 @@ struct ConversationListView: View {
     @State private var workspacePullDistance: CGFloat = 0
     @State private var workspaceCloseDistance: CGFloat = 0
     @State private var workspacePullTracking = false
-    @GestureState private var workspacePullGestureRunning = false
-    @State private var conversationListAtTop = true
-    /// When the list last came to rest at the top; a scroll that only just arrived there
-    /// (momentum or the same finger still scrolling up) must not open the workspace.
-    @State private var conversationListAtTopSince = Date.distantPast
-    /// Decided once on the first sample of each drag: nil = undecided, true = may pull.
-    @State private var workspacePullEligible: Bool?
     @State private var showingAddWorkspace = false
     @State private var selectedWorkspaceItem: WorkspaceItem?
     @AppStorage("aiConversationsJSON") private var conversationsJSON = ""
@@ -4764,16 +4800,14 @@ struct ConversationListView: View {
                             }
                         }
                         .coordinateSpace(name: "conversation-list-scroll")
-                        .onPreferenceChange(ConversationScrollOffsetKey.self) { value in
-                            guard !workspaceLayerVisible else { return }
-                            let atTop = value >= -2
-                            if conversationListAtTop != atTop {
-                                conversationListAtTop = atTop
-                                if atTop { conversationListAtTopSince = Date() }
-                            }
-                        }
-                        .scrollDisabled(workspaceLayerVisible)
-                        .scrollBounceBehavior(.basedOnSize)
+                        .modifier(ScrollEdgePullTracker(
+                            edge: .top,
+                            enabled: !workspaceLayerVisible && !workspaceOpen && selectedConversation == nil && search.isEmpty,
+                            onPull: updateWorkspacePull,
+                            onRelease: finishWorkspacePull
+                        ))
+                        .scrollDisabled(workspaceOpen)
+                        .scrollBounceBehavior(.always)
                         .scrollDismissesKeyboard(.interactively)
                     }
                 }
@@ -4849,7 +4883,6 @@ struct ConversationListView: View {
                 .zIndex(1)
             }
         }
-        .simultaneousGesture(workspacePullGesture)
         .toolbar(workspaceOpen ? .hidden : .automatic, for: .navigationBar)
         .toolbar((workspaceOpen || selectedConversation != nil) ? .hidden : .automatic, for: .tabBar)
         .sheet(isPresented: $showingAddWorkspace) {
@@ -4887,13 +4920,6 @@ struct ConversationListView: View {
             }
         }
         .onChange(of: workspaceOpen) { _, _ in syncRootTabBarVisibility() }
-        .onChange(of: workspacePullGestureRunning) { _, running in
-            // GestureState also resets when another system gesture cancels the drag.
-            if !running {
-                workspacePullEligible = nil
-                if workspacePullTracking { cancelWorkspacePull() }
-            }
-        }
         .onChange(of: store.hasLoadedInitialMessages) { _, _ in syncClaudeUnreadState() }
         .onChange(of: store.msgs.last?.id) { _, _ in syncClaudeUnreadState() }
     }
@@ -4912,59 +4938,35 @@ struct ConversationListView: View {
         return workspacePullDistance
     }
 
-    private var workspacePullGesture: some Gesture {
-        // The front layer moves during this gesture. Its local coordinate space
-        // would feed that movement back into the next translation sample.
-        DragGesture(minimumDistance: 8, coordinateSpace: .global)
-            .updating($workspacePullGestureRunning) { _, running, _ in
-                running = true
+    /// Overscroll beyond the dead zone while the drag started from rest at the top.
+    private func updateWorkspacePull(_ overscroll: CGFloat) {
+        let pulled = overscroll - Self.workspacePullDeadZone
+        guard workspacePullTracking || pulled > 0 else { return }
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            workspacePullTracking = true
+            workspaceLayerVisible = true
+            workspacePullDistance = min(max(pulled, 0), 280)
+        }
+    }
+
+    private func finishWorkspacePull(_ overscroll: CGFloat) {
+        guard workspacePullTracking else { return }
+        workspacePullTracking = false
+        if overscroll - Self.workspacePullDeadZone >= Self.workspaceOpenThreshold {
+            withAnimation(.snappy(duration: 0.42, extraBounce: 0.02)) {
+                workspaceOpen = true
+                workspacePullDistance = 0
             }
-            .onChanged { value in
-                guard !workspaceOpen, selectedConversation == nil else { return }
-                // Only a drag that starts while the list is already resting at the top may
-                // pull the workspace; scrolling back up to the top never does.
-                if workspacePullEligible == nil {
-                    workspacePullEligible = conversationListAtTop &&
-                        Date().timeIntervalSince(conversationListAtTopSince) > 0.25 &&
-                        search.isEmpty &&
-                        value.translation.height > 0 &&
-                        abs(value.translation.height) > abs(value.translation.width)
-                }
-                guard workspacePullEligible == true else { return }
-                // The first stretch behaves like the normal list bounce; the layer only
-                // starts to show after the dead zone.
-                let pulled = value.translation.height - Self.workspacePullDeadZone
-                guard workspacePullTracking || pulled > 0 else { return }
-                var transaction = Transaction()
-                transaction.disablesAnimations = true
-                withTransaction(transaction) {
-                    workspacePullTracking = true
-                    workspaceLayerVisible = true
-                    workspacePullDistance = min(max(pulled * 0.92, 0), 280)
-                }
-            }
-            .onEnded { value in
-                guard workspacePullTracking else { return }
-                workspacePullTracking = false
-                let shouldOpen = !workspaceOpen && search.isEmpty &&
-                    workspacePullDistance >= Self.workspaceOpenThreshold
-                if shouldOpen {
-                    withAnimation(.snappy(duration: 0.42, extraBounce: 0.02)) {
-                        workspaceOpen = true
-                        workspacePullDistance = 0
-                    }
-                } else {
-                    withAnimation(.snappy(duration: 0.30, extraBounce: 0.02)) {
-                        workspacePullDistance = 0
-                    }
-                    hideWorkspaceLayerAfterAnimation()
-                }
-            }
+        } else {
+            cancelWorkspacePull()
+        }
     }
 
     /// Pull past the dead zone, then this much more, before releasing opens the workspace.
-    private static let workspacePullDeadZone: CGFloat = 24
-    private static let workspaceOpenThreshold: CGFloat = 80
+    private static let workspacePullDeadZone: CGFloat = 30
+    private static let workspaceOpenThreshold: CGFloat = 90
 
     private func cancelWorkspacePull() {
         workspacePullTracking = false
