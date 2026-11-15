@@ -1,0 +1,7 @@
+data.json
+uploads/
+albums.json
+favorites.json
+private-album-photos/
+private-favorite-files/
+.env

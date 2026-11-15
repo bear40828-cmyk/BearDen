@@ -1,0 +1,9 @@
+data/
+__pycache__/
+*.pyc
+.env
+.chat-pass
+.upload-token
+.vapid-public
+.vapid-private.pem
+*.pem

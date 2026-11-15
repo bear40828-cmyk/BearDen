@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" href="/icon-192.png" type="image/png">
+<title>熊窝 · 网页版</title>
+<style>
+:root{--bg:#fbf4fa;--panel:#fff;--line:#eedcea;--text:#4a3346;--muted:#a58aa0;--me:#f6c6de;--me2:#e7c8f5;--ai:#ffffff;--accent:#c879b8}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;color:var(--text);background:linear-gradient(135deg,#fde7f3,#efe3fb)}
+button,input,textarea{font:inherit}
+.wrap{max-width:1100px;height:100vh;margin:0 auto;display:flex;flex-direction:column;background:var(--bg);box-shadow:0 0 40px #c879b822}
+header{display:flex;align-items:center;gap:12px;padding:14px 24px;border-bottom:1px solid var(--line);background:#fff8fcdd}
+header img{width:36px;height:36px;border-radius:50%}
+header h1{font-size:17px;margin:0;font-weight:600}
+header .st{font-size:12px;color:var(--muted)}
+header .sp{flex:1}
+header button{border:1px solid var(--line);background:#fff;color:var(--muted);border-radius:16px;padding:4px 12px;cursor:pointer}
+#list{flex:1;overflow-y:auto;padding:18px 28px}
+.more{display:block;margin:0 auto 14px;border:0;background:#f3e3ef;color:var(--accent);border-radius:14px;padding:5px 14px;cursor:pointer}
+.day{text-align:center;color:var(--muted);font-size:12px;margin:16px 0 8px}
+.row{display:flex;margin:4px 0}
+.row.me{justify-content:flex-end}
+.b{max-width:min(62%,640px);padding:9px 14px;border-radius:18px;line-height:1.55;white-space:pre-wrap;word-break:break-word;font-size:15px}
+.row.claude .b{background:var(--ai);border:1px solid var(--line);border-bottom-left-radius:6px}
+.row.me .b{background:linear-gradient(135deg,var(--me),var(--me2));border-bottom-right-radius:6px}
+.row.imp .b{opacity:.75}
+.b img{display:block;max-width:320px;max-height:320px;border-radius:12px;margin:2px 0;cursor:zoom-in}
+.b a{color:var(--accent)}
+.t{font-size:11px;color:var(--muted);align-self:flex-end;margin:0 6px}
+.tag{display:inline-block;font-size:13px;color:var(--accent);background:#f8e6f3;border-radius:10px;padding:2px 8px;margin:2px 0}
+.quote{font-size:13px;color:var(--muted);border-left:3px solid var(--me);padding-left:8px;margin-bottom:4px}
+.sys{text-align:center;font-size:13px;color:var(--muted);margin:8px 0}
+.typing .b{color:var(--muted)}
+footer{display:flex;gap:10px;padding:14px 24px;border-top:1px solid var(--line);background:#fff8fc}
+footer textarea{flex:1;resize:none;height:64px;border:1px solid var(--line);border-radius:14px;padding:10px 14px;outline:none;background:#fff;color:var(--text)}
+footer textarea:focus{border-color:var(--accent)}
+footer button{border:0;border-radius:14px;padding:0 22px;background:linear-gradient(135deg,#e99cc8,#b98be0);color:#fff;font-weight:600;cursor:pointer}
+footer button:disabled{opacity:.5}
+#login{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:linear-gradient(135deg,#fde7f3,#efe3fb)}
+#login form{background:#fff;padding:32px 36px;border-radius:24px;box-shadow:0 10px 40px #c879b833;display:flex;flex-direction:column;gap:14px;width:320px;text-align:center}
+#login img{width:72px;height:72px;margin:0 auto;border-radius:50%}
+#login input{border:1px solid var(--line);border-radius:12px;padding:10px 12px;outline:none}
+#login button{border:0;border-radius:12px;padding:10px;background:linear-gradient(135deg,#e99cc8,#b98be0);color:#fff;font-weight:600;cursor:pointer}
+#viewer{position:fixed;inset:0;background:#000c;display:none;align-items:center;justify-content:center;cursor:zoom-out}
+#viewer img{max-width:92vw;max-height:92vh;border-radius:8px}
+</style>
+</head>
+<body>
+<div id="login"><form id="lf">
+  <img src="/icon-192.png" alt="">
+  <div style="font-size:18px;font-weight:600">熊窝 · 网页版</div>
+  <input id="lp" type="password" placeholder="口令（和手机端一样）" autocomplete="current-password">
+  <button>进入</button>
+</form></div>
+
+<div class="wrap" id="app" style="display:none">
+  <header>
+    <img src="/icon-192.png" alt="">
+    <div><h1>熊窝</h1><div class="st" id="st">连接中…</div></div>
+    <div class="sp"></div>
+    <button id="out">退出</button>
+  </header>
+  <div id="list"></div>
+  <footer>
+    <textarea id="tx" placeholder="Enter 发送，Shift+Enter 换行"></textarea>
+    <button id="send">发送</button>
+  </footer>
+</div>
+<div id="viewer"><img alt=""></div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const PAGE = 200;
+  let pass = localStorage.getItem('pass') || '';
+  let all = [], shown = 0, last = 0, timer = null, es = null;
+  const typing = {};   // response_id:bubble_index -> element
+
+  function showLogin() { $('login').style.display = 'flex'; $('app').style.display = 'none'; $('lp').focus(); }
+  $('lf').onsubmit = e => {
+    e.preventDefault();
+    const v = $('lp').value.trim(); if (!v) return;
+    pass = v; localStorage.setItem('pass', v); start();
+  };
+  $('out').onclick = () => { localStorage.removeItem('pass'); pass = ''; location.reload(); };
+
+  const hdr = extra => Object.assign({ 'X-Pass': pass }, extra || {});
+  const b64 = s => { try { return decodeURIComponent(escape(atob(s))); } catch (e) { return s; } };
+  const fileUrl = n => '/api/file/' + encodeURIComponent(n);
+  const esc = s => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const fmtT = ts => new Date(ts * 1000).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+  const fmtD = ts => new Date(ts * 1000).toLocaleDateString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric', weekday: 'short' });
+
+  // 文字里的标记做成可读占位
+  function renderText(t) {
+    let h = esc(t);
+    h = h.replace(/\[\[bear-pat\|([^|\]]*)\|([^|\]]*)(?:\|([^|\]]*))?\]\]/g, (_, a, b, c) =>
+      '<span class="tag">👋 ' + esc(b64(a)) + ' 拍了拍 ' + esc(b64(b)) + esc(c ? b64(c) : '') + '</span>');
+    h = h.replace(/\[\[bear-reply\|(\d+)\|([^|\]]*)\|([^|\]]*)\]\]/g, (_, id, n, q) =>
+      '<div class="quote">' + esc(b64(n)) + '：' + esc(b64(q)) + '</div>');
+    h = h.replace(/\[\[bear-album\|[^\]]*\]\]/g, '<span class="tag">📷 相册里的照片</span>');
+    h = h.replace(/\[\[bear-location\|([-\d.]+)\|([-\d.]+)\]\]/g, (_, la, lo) =>
+      '<span class="tag">📍 位置 ' + (+la).toFixed(4) + ', ' + (+lo).toFixed(4) + '</span>');
+    h = h.replace(/\[\[bear-[a-z]+\|[^\]]*\]\]/g, '<span class="tag">[特殊消息]</span>');
+    h = h.replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1" target="_blank" rel="noopener">$1</a>');
+    return h;
+  }
+
+  // 一条消息 -> 若干气泡（助手文字里单独一行的「〰」处切开）
+  function bubbles(m) {
+    const out = [];
+    if (m.file) {
+      if (/\.(jpe?g|png|gif|webp|heic)$/i.test(m.file)) out.push('<img src="' + fileUrl(m.file) + '" loading="lazy" alt="">');
+      else out.push('<a href="' + fileUrl(m.file) + '" target="_blank">📎 ' + esc(m.file.replace(/^\d+-/, '')) + '</a>');
+    }
+    const text = (m.text || '').trim();
+    if (text) {
+      const parts = m.from === 'claude' ? text.split(/\n?^[ \t]*〰[ \t]*$\n?/m) : [text];
+      for (const p of parts) if (p.trim()) out.push(renderText(p.trim()));
+    }
+    return out;
+  }
+
+  let lastDay = '';
+  function node(m) {
+    const frag = document.createDocumentFragment();
+    const d = fmtD(m.ts);
+    if (d !== lastDay) { lastDay = d; const x = document.createElement('div'); x.className = 'day'; x.textContent = d; frag.appendChild(x); }
+    const who = m.from === 'me' ? 'me' : 'claude';
+    const bs = bubbles(m);
+    bs.forEach((h, i) => {
+      const row = document.createElement('div');
+      row.className = 'row ' + who + (m.imported ? ' imp' : '');
+      row.dataset.id = m.id;
+      const b = document.createElement('div'); b.className = 'b'; b.innerHTML = h;
+      const t = document.createElement('div'); t.className = 't'; t.textContent = i === bs.length - 1 ? fmtT(m.ts) : '';
+      if (who === 'me') { row.appendChild(t); row.appendChild(b); } else { row.appendChild(b); row.appendChild(t); }
+      frag.appendChild(row);
+    });
+    return frag;
+  }
+
+  function nearBottom() { const l = $('list'); return l.scrollHeight - l.scrollTop - l.clientHeight < 120; }
+  function toBottom() { const l = $('list'); l.scrollTop = l.scrollHeight; }
+
+  function renderAll() {
+    const l = $('list'); l.innerHTML = ''; lastDay = '';
+    const start = Math.max(0, all.length - shown);
+    if (start > 0) {
+      const btn = document.createElement('button'); btn.className = 'more'; btn.textContent = '加载更早的消息';
+      btn.onclick = () => { const h = l.scrollHeight; shown += PAGE; renderAll(); l.scrollTop = l.scrollHeight - h; };
+      l.appendChild(btn);
+    }
+    for (const m of all.slice(start)) l.appendChild(node(m));
+  }
+
+  function addNew(ms) {
+    const stick = nearBottom();
+    for (const m of ms) {
+      if (all.some(x => x.id === m.id)) continue;
+      all.push(m); shown++;
+      // 流式占位换成正式消息
+      if (m.response_id != null) { const k = m.response_id + ':' + m.bubble_index; if (typing[k]) { typing[k].remove(); delete typing[k]; } }
+      $('list').appendChild(node(m));
+    }
+    if (stick) toBottom();
+  }
+
+  async function poll() {
+    try {
+      const r = await fetch('/api/messages?since=' + last, { headers: hdr() });
+      if (r.status === 401) { localStorage.removeItem('pass'); pass = ''; showLogin(); return; }
+      if (!r.ok) throw 0;
+      const ms = await r.json();
+      if (ms.length) { last = Math.max(last, ...ms.map(m => m.id)); addNew(ms); }
+      $('st').textContent = '在线';
+    } catch (e) { $('st').textContent = '连接断开，重试中…'; }
+    timer = setTimeout(poll, 2000);
+  }
+
+  function stream() {
+    try { es = new EventSource('/api/stream'); } catch (e) { return; }
+    const upd = ev => {
+      let d; try { d = JSON.parse(ev.data); } catch (e) { return; }
+      const k = d.response_id + ':' + d.bubble_index;
+      if (all.some(m => m.response_id === d.response_id && m.bubble_index === d.bubble_index)) return;
+      let el = typing[k];
+      if (!el) {
+        const stick = nearBottom();
+        el = document.createElement('div'); el.className = 'row claude typing';
+        el.innerHTML = '<div class="b">…</div>'; $('list').appendChild(el); typing[k] = el;
+        if (stick) toBottom();
+      }
+      if (d.text) el.firstChild.textContent = d.text.replace(/^[ \t]*〰[ \t]*$/mg, '');
+    };
+    es.addEventListener('bubble_start', upd);
+    es.addEventListener('text_delta', upd);
+    es.addEventListener('response_done', () => setTimeout(() => {
+      for (const k in typing) { typing[k].remove(); delete typing[k]; }
+    }, 6000));
+  }
+
+  async function send() {
+    const text = $('tx').value.trim();
+    if (!text) return;
+    $('send').disabled = true;
+    try {
+      // 与手机端完全相同：POST /api/send {text}，服务器记为 from=me
+      const r = await fetch('/api/send', { method: 'POST', headers: hdr({ 'Content-Type': 'application/json' }), body: JSON.stringify({ text }) });
+      if (!r.ok) throw 0;
+      $('tx').value = '';
+      const m = await r.json(); addNew([m]); last = Math.max(last, m.id); toBottom();
+    } catch (e) { alert('发送失败，稍后再试'); }
+    $('send').disabled = false; $('tx').focus();
+  }
+  $('send').onclick = send;
+  $('tx').addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
+  });
+
+  $('list').addEventListener('click', e => {
+    if (e.target.tagName === 'IMG') { $('viewer').firstChild.src = e.target.src; $('viewer').style.display = 'flex'; }
+  });
+  $('viewer').onclick = () => { $('viewer').style.display = 'none'; };
+
+  async function start() {
+    $('login').style.display = 'none'; $('app').style.display = 'flex';
+    $('st').textContent = '加载中…';
+    try {
+      const r = await fetch('/api/messages?since=0', { headers: hdr() });
+      if (r.status === 401) { localStorage.removeItem('pass'); pass = ''; return showLogin(); }
+      all = await r.json();
+    } catch (e) { all = []; }
+    last = all.reduce((a, m) => Math.max(a, m.id), 0);
+    shown = PAGE; renderAll(); toBottom();
+    poll(); stream();
+    $('tx').focus();
+  }
+
+  pass ? start() : showLogin();
+})();
+</script>
+</body>
+</html>

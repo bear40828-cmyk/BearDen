@@ -1,0 +1,13 @@
+BearMailbox/Resources/DeviceToken.txt
+DeviceToken.txt
+*.ipa
+build/
+DerivedData/
+Server/data/
+.env
+Backend/moments/data.json
+Backend/moments/uploads/
+Backend/moments/albums.json
+Backend/moments/favorites.json
+Backend/moments/private-album-photos/
+Backend/moments/private-favorite-files/

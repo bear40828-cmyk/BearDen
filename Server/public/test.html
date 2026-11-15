@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>助手</title>
+<style>
+  :root { --bg:#fff6f9; --fg:#4a2f3c; --me:#f7b8cf; --him:#ffffff; --line:#f1d7e1; --muted:#a07f8e; }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --bg:#2a1f27; --fg:#f6dce7; --me:#8e4a68; --him:#3a2c35; --line:#47343f; --muted:#b08ea0; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.5 -apple-system,system-ui,sans-serif;
+         display:flex; flex-direction:column; height:100dvh; }
+  header { padding:14px 16px; text-align:center; font-weight:600; border-bottom:1px solid var(--line); }
+  #log { flex:1; overflow-y:auto; padding:12px 16px; display:flex; flex-direction:column; gap:8px; }
+  .b { max-width:80%; padding:8px 12px; border-radius:16px; white-space:pre-wrap; word-break:break-word; }
+  .me { align-self:flex-end; background:var(--me); border-bottom-right-radius:4px; }
+  .claude { align-self:flex-start; background:var(--him); border-bottom-left-radius:4px; }
+  form { display:flex; gap:8px; padding:10px 16px calc(10px + env(safe-area-inset-bottom)); border-top:1px solid var(--line); }
+  textarea { flex:1; resize:none; border:1px solid var(--line); border-radius:12px; padding:8px 10px;
+             background:var(--him); color:var(--fg); font:inherit; max-height:120px; }
+  button { border:0; border-radius:12px; padding:0 16px; background:var(--me); color:var(--fg); font:inherit; font-weight:600; }
+  #login { padding:40px 16px; display:none; flex-direction:column; gap:10px; }
+  #login input { padding:10px; border-radius:12px; border:1px solid var(--line); background:var(--him); color:var(--fg); font:inherit; }
+  .hint { color:var(--muted); font-size:13px; text-align:center; }
+</style>
+</head>
+<body>
+<header>助手</header>
+<div id="login">
+  <div class="hint">输入口令（只用输一次）</div>
+  <input id="pass" type="password" autocomplete="current-password">
+  <button id="go" style="padding:10px">进去</button>
+</div>
+<div id="log"></div>
+<form id="f">
+  <textarea id="t" rows="1" placeholder="说点什么"></textarea>
+  <button>发</button>
+</form>
+<script>
+const $ = s => document.querySelector(s);
+let pass = ''; try { pass = localStorage.getItem('pass') || ''; } catch (e) {}
+let last = 0;
+
+function show(on) {
+  $('#login').style.display = on ? 'flex' : 'none';
+  $('#log').style.display = $('#f').style.display = on ? 'none' : '';
+}
+
+function add(m) {
+  const d = document.createElement('div');
+  d.className = 'b ' + (m.from === 'me' ? 'me' : 'claude');
+  d.textContent = m.text;
+  $('#log').appendChild(d);
+  $('#log').scrollTop = 1e9;
+}
+
+async function poll() {
+  try {
+    const r = await fetch('/api/messages?since=' + last, { headers: { 'X-Pass': pass } });
+    if (r.status === 401) { show(true); return; }
+    for (const m of await r.json()) { add(m); last = m.id; }
+  } catch (e) {}
+}
+
+$('#go').onclick = () => {
+  pass = $('#pass').value.trim();
+  try { localStorage.setItem('pass', pass); } catch (e) {}
+  show(false); poll();
+};
+
+$('#f').onsubmit = async e => {
+  e.preventDefault();
+  const text = $('#t').value.trim(); if (!text) return;
+  $('#t').value = '';
+  await fetch('/api/send', { method: 'POST', headers: { 'X-Pass': pass, 'Content-Type': 'application/json' },
+                             body: JSON.stringify({ text }) });
+  poll();
+};
+
+if (!pass) show(true); else poll();
+setInterval(poll, 2000);
+</script>
+</body>
+</html>
