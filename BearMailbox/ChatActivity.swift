@@ -1,4 +1,5 @@
 import SwiftUI
+import Security
 
 struct ChatToolStep: Codable, Equatable, Identifiable, Sendable {
     var id: String
@@ -64,6 +65,9 @@ struct ChatActivityPreference: View {
     let conversationID: String
     @AppStorage private var enabled: Bool
     @State private var syncError: String?
+    @State private var needsCredential = false
+    @State private var retry = 0
+    @State private var credentialDraft = ""
 
     init(conversationID: String) {
         self.conversationID = conversationID
@@ -80,16 +84,32 @@ struct ChatActivityPreference: View {
             if enabled, let syncError {
                 Text(syncError).font(.system(size: 12)).foregroundStyle(.secondary)
             }
+            if enabled && needsCredential {
+                HStack {
+                    SecureField("工作台凭证", text: $credentialDraft)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    Button("保存") {
+                        WorkbenchCredential.save(credentialDraft)
+                        credentialDraft = ""
+                        retry += 1
+                    }
+                    .disabled(credentialDraft.isEmpty)
+                }
+                .font(.system(size: 13))
+            }
         }
         .tint(Color(red: 1.00, green: 0.67, blue: 0.80))
         .padding(.vertical, 14)
-        .task(id: enabled) {
-            guard enabled && conversationID == "claude" else { syncError = nil; return }
+        .task(id: "\(enabled)-\(retry)") {
+            guard enabled && conversationID == "claude" else { syncError = nil; needsCredential = false; return }
             do {
                 _ = try await RemoteChatActivityClient.fetch(messageIDs: [1])
                 syncError = nil
-            } catch RemoteChatActivityClient.SyncError.needsConnection {
-                syncError = "未设置服务器地址，无法同步过程记录。"
+                needsCredential = false
+            } catch RemoteChatActivityClient.SyncError.unauthorized {
+                syncError = RemoteChatActivityClient.SyncError.unauthorized.errorDescription
+                needsCredential = true
             } catch {
                 syncError = error.localizedDescription
             }
@@ -405,21 +425,31 @@ actor ThinkingTranslatorCache {
 
 enum ThinkingTranslator {
     struct Response: Decodable { var zh: String }
-    /// Server-side translation lived behind the removed terminal service;
-    /// the open-source build has no translation endpoint, so callers fall
-    /// back to showing the original text.
+    /// Translation is served by the optional workbench server (POST /api/terminal/translate).
     static func translate(_ text: String) async throws -> String {
         if let hit = await ThinkingTranslatorCache.shared.get(text) { return hit }
-        throw RemoteChatActivityClient.SyncError.needsConnection
+        let body = try JSONSerialization.data(withJSONObject: ["text": String(text.prefix(20000))])
+        guard var request = WorkbenchAPI.request(path: "/api/terminal/translate", method: "POST", body: body) else {
+            throw RemoteChatActivityClient.SyncError.needsConnection
+        }
+        request.timeoutInterval = 60
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw RemoteChatActivityClient.SyncError.server((response as? HTTPURLResponse)?.statusCode ?? 0)
+        }
+        let zh = try JSONDecoder().decode(Response.self, from: data).zh
+        await ThinkingTranslatorCache.shared.set(text, zh)
+        return zh
     }
 }
 
 enum RemoteChatActivityClient {
     enum SyncError: LocalizedError {
-        case needsConnection, server(Int)
+        case needsConnection, unauthorized, server(Int)
         var errorDescription: String? {
             switch self {
-            case .needsConnection: return "未设置服务器地址，无法同步过程记录。"
+            case .needsConnection: return "未设置工作台地址，无法同步过程记录。"
+            case .unauthorized: return "工作台凭证无效，请在下方重新填写。"
             case .server: return "过程记录暂时连接不上，请稍后重试。"
             }
         }
@@ -427,12 +457,78 @@ enum RemoteChatActivityClient {
     struct Entry: Decodable { var messageID: Int; var activity: ChatActivity }
     struct Response: Decodable { var entries: [Entry] }
 
-    /// Activity sync lived behind the removed terminal service; the
-    /// open-source build has no activity endpoint. Callers treat this as
-    /// "not connected" and show the local state instead.
+    /// Activity records come from the optional workbench server (GET /api/terminal/chat-activity).
     static func fetch(messageIDs: [Int]) async throws -> [Int: ChatActivity] {
         guard !messageIDs.isEmpty else { return [:] }
-        throw SyncError.needsConnection
+        guard var request = WorkbenchAPI.request(path: "/api/terminal/chat-activity"),
+              let requestURL = request.url,
+              var url = URLComponents(url: requestURL, resolvingAgainstBaseURL: false) else {
+            throw SyncError.needsConnection
+        }
+        url.queryItems = [URLQueryItem(name: "ids", value: messageIDs.suffix(40).map(String.init).joined(separator: ","))]
+        request.url = url.url
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw SyncError.server(0) }
+        if http.statusCode == 401 || http.statusCode == 403 { throw SyncError.unauthorized }
+        guard http.statusCode == 200 else { throw SyncError.server(http.statusCode) }
+        let decoded = try JSONDecoder().decode(Response.self, from: data)
+        return Dictionary(decoded.entries.map { entry in
+            var activity = entry.activity
+            if activity.thinking.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                activity.thinkingUnavailable = true
+            }
+            return (entry.messageID, activity)
+        }, uniquingKeysWith: { _, latest in latest })
+    }
+}
+
+/// Requests to the optional workbench server. The bearer is the workbench credential saved
+/// in the keychain, falling back to the bundled device credential.
+enum WorkbenchAPI {
+    static func request(path: String, method: String = "GET", body: Data? = nil) -> URLRequest? {
+        guard let base = ServerConfig.workbenchBase else { return nil }
+        let saved = WorkbenchCredential.load()
+        let token = saved.isEmpty ? BeardenAuth.token : saved
+        var request = URLRequest(url: base.appending(path: path))
+        request.httpMethod = method
+        request.httpBody = body
+        request.timeoutInterval = 15
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        if !token.isEmpty { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+        if body != nil { request.setValue("application/json", forHTTPHeaderField: "Content-Type") }
+        return request
+    }
+}
+
+enum WorkbenchCredential {
+    private static var service: String { (Bundle.main.bundleIdentifier ?? "app.bearden.mailbox") + ".vps-terminal" }
+    private static let account = "terminal-token"
+
+    private static var key: [String: Any] {
+        [kSecClass as String: kSecClassGenericPassword,
+         kSecAttrService as String: service,
+         kSecAttrAccount as String: account]
+    }
+
+    static func load() -> String {
+        var query = key
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data,
+              let value = String(data: data, encoding: .utf8) else { return "" }
+        return value
+    }
+
+    static func save(_ value: String) {
+        SecItemDelete(key as CFDictionary)
+        let clean = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { return }
+        var item = key
+        item[kSecValueData as String] = Data(clean.utf8)
+        item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        SecItemAdd(item as CFDictionary, nil)
     }
 }
 

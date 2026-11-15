@@ -377,14 +377,34 @@ private enum AppBackdropImageCache {
         let key = NSNumber(value: version)
         if let cached = images.object(forKey: key) { return cached }
         guard let loaded = UIImage(contentsOfFile: SettingsView.homeBgPath.path) else { return nil }
-        let prepared = loaded.preparingForDisplay() ?? loaded
+        let prepared = screenSized(loaded)
         images.setObject(prepared, forKey: key)
         return prepared
     }
 
     static func store(_ image: UIImage, version: Int) {
-        let prepared = image.preparingForDisplay() ?? image
+        let prepared = screenSized(image)
         images.setObject(prepared, forKey: NSNumber(value: version))
+    }
+
+    /// The backdrop sits under every glass layer, which re-samples it each frame; a
+    /// full-resolution photo there costs frames on every screen. Keep it at screen size.
+    private static func screenSized(_ image: UIImage) -> UIImage {
+        let bounds = UIScreen.main.bounds
+        let scale = UIScreen.main.scale
+        let target = max(bounds.width, bounds.height) * scale
+        let longest = max(image.size.width * image.scale, image.size.height * image.scale)
+        guard longest > target * 1.05 else { return image.preparingForDisplay() ?? image }
+        let ratio = target / longest
+        let size = CGSize(width: image.size.width * image.scale * ratio / scale,
+                          height: image.size.height * image.scale * ratio / scale)
+        let format = UIGraphicsImageRendererFormat.default()
+        format.scale = scale
+        format.opaque = true
+        let resized = UIGraphicsImageRenderer(size: size, format: format).image { _ in
+            image.draw(in: CGRect(origin: .zero, size: size))
+        }
+        return resized.preparingForDisplay() ?? resized
     }
 }
 
@@ -437,6 +457,8 @@ struct AppBackdrop: View {
                         .blur(radius: 65)
                         .offset(x: -170, y: 300)
                 }
+                // Flatten the blurred gradient into one layer so it is not re-filtered per frame.
+                .drawingGroup()
             }
         }
         .ignoresSafeArea()
@@ -4225,9 +4247,9 @@ private struct ScrollEdgePullTracker: ViewModifier {
     let onPull: (CGFloat) -> Void
     let onRelease: (CGFloat) -> Void
 
-    @State private var eligible = false
-    @State private var interacting = false
-    @State private var overscroll: CGFloat = 0
+    /// Plain reference storage: scroll samples must not invalidate any view.
+    private final class Track { var eligible = false; var interacting = false; var overscroll: CGFloat = 0 }
+    @State private var track = Track()
 
     @available(iOS 18.0, *)
     private func edgeOverscroll(_ g: ScrollGeometry) -> CGFloat {
@@ -4245,19 +4267,21 @@ private struct ScrollEdgePullTracker: ViewModifier {
             content
                 .onScrollPhaseChange { old, new, context in
                     if new == .interacting {
-                        interacting = true
+                        track.interacting = true
                         // Must start from rest (not mid-momentum) with the content at the edge.
-                        eligible = enabled && old == .idle && abs(edgeOverscroll(context.geometry)) <= 1
-                    } else if interacting {
-                        interacting = false
-                        if eligible { onRelease(max(overscroll, 0)) }
-                        eligible = false
+                        track.eligible = enabled && old == .idle && abs(edgeOverscroll(context.geometry)) <= 1
+                        track.overscroll = 0
+                    } else if track.interacting {
+                        track.interacting = false
+                        if track.eligible { onRelease(track.overscroll) }
+                        track.eligible = false
                     }
                 }
-                .onScrollGeometryChange(for: CGFloat.self, of: { edgeOverscroll($0) }) { _, value in
-                    overscroll = value
-                    guard interacting, eligible else { return }
-                    onPull(max(value, 0))
+                // Clamped so ordinary scrolling (negative overscroll) produces no callbacks.
+                .onScrollGeometryChange(for: CGFloat.self, of: { max(edgeOverscroll($0), 0) }) { _, value in
+                    track.overscroll = value
+                    guard track.interacting, track.eligible else { return }
+                    onPull(value)
                 }
         } else {
             content
