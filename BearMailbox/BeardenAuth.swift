@@ -7,7 +7,7 @@ import WebKit
 /// The server host comes from Settings -> Server address; with no address
 /// configured there is no host to authenticate against and auth is inert.
 enum BeardenAuth {
-    static var momentsHost: String? { ServerConfig.host }
+    static var momentsHost: String? { ServerConfig.momentsBase?.host }
 
     static let token: String = {
         guard let url = Bundle.main.url(forResource: "DeviceToken", withExtension: "txt"),

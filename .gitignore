@@ -11,3 +11,5 @@ Backend/moments/albums.json
 Backend/moments/favorites.json
 Backend/moments/private-album-photos/
 Backend/moments/private-favorite-files/
+BearMailbox/Resources/ServerConfig.json
+ServerConfig.json

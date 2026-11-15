@@ -513,9 +513,7 @@ private struct NativeMomentRow: View {
     }
 
     private var savedConversations: [AIConversation] {
-        guard let data = conversationsJSON.data(using: .utf8),
-              let conversations = try? JSONDecoder().decode([AIConversation].self, from: data) else { return [] }
-        return conversations
+        MomentConversationMemo.conversations(for: conversationsJSON)
     }
 
     private var puppyConversation: AIConversation? {
@@ -607,12 +605,30 @@ private struct NativeMomentRow: View {
     }
 }
 
+/// Decodes the saved conversation list once per distinct JSON string instead of per lookup.
+private enum MomentConversationMemo {
+    private static var json: String?
+    private static var value: [AIConversation] = []
+
+    static func conversations(for raw: String) -> [AIConversation] {
+        if raw == json { return value }
+        json = raw
+        value = raw.data(using: .utf8).flatMap { try? JSONDecoder().decode([AIConversation].self, from: $0) } ?? []
+        return value
+    }
+}
+
 private enum MomentLocalAvatarStore {
+    private static let cache = NSCache<NSString, UIImage>()
+
     static func image(named name: String?) -> UIImage? {
         guard let name, !name.isEmpty else { return nil }
+        if let cached = cache.object(forKey: name as NSString) { return cached }
         let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("AIAvatars", isDirectory: true)
-        return UIImage(contentsOfFile: root.appendingPathComponent(name).path)
+        guard let image = UIImage(contentsOfFile: root.appendingPathComponent(name).path) else { return nil }
+        cache.setObject(image, forKey: name as NSString)
+        return image
     }
 }
 

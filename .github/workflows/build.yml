@@ -24,6 +24,12 @@ jobs:
         run: |
           mkdir -p ipa-root/Payload
           cp -r build/Build/Products/Release-iphoneos/BearMailbox.app ipa-root/Payload/
+      - name: Upload unsigned app
+        uses: actions/upload-artifact@v4
+        with:
+          name: BearMailbox-unsigned
+          path: ipa-root
+          retention-days: 1
   ui-check:
     runs-on: macos-15
     steps:

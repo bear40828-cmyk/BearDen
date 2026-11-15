@@ -49,7 +49,8 @@ enum ChatGPTAuthError: LocalizedError {
 }
 
 enum ChatGPTCredentialStore {
-    private static let service = "app.bearden.mailbox.ai"
+    // Keychain service follows the bundle identifier so differently-identified builds keep separate stores.
+    private static let service = (Bundle.main.bundleIdentifier ?? "app.bearden.mailbox") + ".ai"
 
     static func save(_ credential: ChatGPTCredential, account: String) throws {
         let data = try JSONEncoder().encode(credential)

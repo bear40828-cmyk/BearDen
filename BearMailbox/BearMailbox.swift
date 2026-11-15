@@ -27,6 +27,12 @@ struct BearMailboxApp: App {
     @AppStorage("appearanceMode") private var appearanceMode = "light"
 
     init() {
+        ServerConfig.registerBundledDefaults()
+        // Earlier builds stored the assistant remark under a different key; carry it over once.
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: "assistantRemark") == nil, let legacy = defaults.string(forKey: "claudeRemark") {
+            defaults.set(legacy, forKey: "assistantRemark")
+        }
         BeardenAuth.seedNativeCookie()
         #if DEBUG
         if ProcessInfo.processInfo.arguments.contains("--bear-activity-ui-test") {
@@ -71,17 +77,29 @@ struct RootView: View {
     @AppStorage("patSuffix") private var syncedPatSuffix = "并给他两个亿"
     @AppStorage("myNickname") private var syncedMyNickname = "我"
 
-    /// Claude's unread plus every other conversation's inbox unread; re-evaluated whenever the
+    /// The primary assistant's unread plus every other conversation's inbox unread; re-evaluated whenever the
     /// inbox version or the conversation list changes.
-    private var totalUnreadCount: Int {
-        _ = localAIInboxVersion
+    @State private var otherConversationIDs: [String] = []
+    @State private var otherUnreadCount = 0
+
+    private var totalUnreadCount: Int { claudeUnreadCount + otherUnreadCount }
+
+    /// Decodes the conversation list only when it changes.
+    private func refreshConversationIDs() {
         guard let data = conversationsJSON.data(using: .utf8),
               let saved = try? JSONDecoder().decode([AIConversation].self, from: data) else {
-            return claudeUnreadCount
+            otherConversationIDs = []
+            refreshOtherUnread()
+            return
         }
-        return saved.reduce(claudeUnreadCount) { total, conversation in
-            conversation.id == "claude" ? total : total + LocalAIInbox.entry(conversation.id).unreadCount
-        }
+        otherConversationIDs = saved.map(\.id).filter { $0 != "claude" }
+        refreshOtherUnread()
+    }
+
+    /// Sums the in-memory inbox snapshots; no disk or decoding work.
+    private func refreshOtherUnread() {
+        let total = otherConversationIDs.reduce(0) { $0 + LocalAIInbox.entry($1).unreadCount }
+        if total != otherUnreadCount { otherUnreadCount = total }
     }
 
     var body: some View {
@@ -120,6 +138,9 @@ struct RootView: View {
             }
         }
         .task { BearContactProfileSync.shared.schedule(force: true) }
+        .onAppear { refreshConversationIDs() }
+        .onChange(of: conversationsJSON) { _, _ in refreshConversationIDs() }
+        .onChange(of: localAIInboxVersion) { _, _ in refreshOtherUnread() }
         .onChange(of: syncedAssistantRemark) { _, _ in BearContactProfileSync.shared.schedule() }
         .onChange(of: syncedPatSuffix) { _, _ in BearContactProfileSync.shared.schedule() }
         .onChange(of: syncedMyNickname) { _, _ in BearContactProfileSync.shared.schedule() }
@@ -215,13 +236,49 @@ enum ServerConfig {
     static var host: String? { baseURL?.host }
     static var isConfigured: Bool { baseURL != nil }
 
-    /// 朋友圈 / 相册 / 收藏服务地址（原 moments 子域名，现与主地址同 host）。
-    static var momentsBase: URL? { baseURL }
-    /// 工作台 / 额度看板地址（原 kanban 子域名，现与主地址同 host）。
-    static var workbenchBase: URL? { baseURL }
+    // ----- 打包时可选的预设 -----
+    // 若 App bundle 内含 ServerConfig.json，则其中的地址作为默认值（设置页仍可改）。
+    // 该文件只在打包时注入，不进仓库（见 .gitignore）。格式：
+    // {"baseURL": "https://example.com", "momentsURL": "https://m.example.com", "workbenchURL": "https://w.example.com"}
+    // momentsURL / workbenchURL 可省略，省略时与 baseURL 同 host。
+    private struct Bundled: Decodable {
+        var baseURL: String?
+        var momentsURL: String?
+        var workbenchURL: String?
+    }
+
+    private static let bundled: Bundled? = {
+        guard let url = Bundle.main.url(forResource: "ServerConfig", withExtension: "json"),
+              let data = try? Data(contentsOf: url) else { return nil }
+        return try? JSONDecoder().decode(Bundled.self, from: data)
+    }()
+
+    /// 把预设主地址注册为 UserDefaults 默认值；用户在设置里填写的值优先。
+    static func registerBundledDefaults() {
+        guard let value = bundled?.baseURL, !value.isEmpty else { return }
+        UserDefaults.standard.register(defaults: [defaultsKey: value])
+    }
+
+    private static func url(_ string: String?) -> URL? {
+        guard let string, let url = URL(string: string.trimmingCharacters(in: .whitespacesAndNewlines)),
+              let scheme = url.scheme, scheme == "http" || scheme == "https", url.host != nil else { return nil }
+        return url
+    }
+
+    /// 仅当用户仍在使用预设主地址时，才采用预设的分服务地址。
+    private static func bundledOverride(_ value: String?) -> URL? {
+        guard let preset = url(value), let presetBase = url(bundled?.baseURL),
+              baseURL?.host == presetBase.host else { return nil }
+        return preset
+    }
+
+    /// 朋友圈 / 相册 / 收藏服务地址；默认与主地址同 host。
+    static var momentsBase: URL? { bundledOverride(bundled?.momentsURL) ?? baseURL }
+    /// 工作台 / 额度看板地址；默认与主地址同 host。
+    static var workbenchBase: URL? { bundledOverride(bundled?.workbenchURL) ?? baseURL }
     /// 看板网页地址（带 glass=1 参数）。
     static var workbenchWebURL: URL? {
-        guard let base = baseURL else { return nil }
+        guard let base = workbenchBase else { return nil }
         var components = URLComponents(url: base, resolvingAgainstBaseURL: false)
         components?.queryItems = [URLQueryItem(name: "glass", value: "1")]
         return components?.url
@@ -3060,21 +3117,24 @@ private enum LocalAIInbox {
 
     private static func key(_ id: String) -> String { "localAIInbox.\(id)" }
 
+    /// Main-thread memory copy of every snapshot; list rows, sorting and the tab badge read
+    /// from here so a render never touches the decoder or the stored chat history.
+    private static var cache: [String: LocalAIInboxEntry] = [:]
+    /// Byte size of the history blob the snapshot was last checked against (memory only).
+    private static var checkedSize: [String: Int] = [:]
+    private static var reconciling: Set<String> = []
+    private static let workQueue = DispatchQueue(label: "app.bearden.local-ai-inbox", qos: .utility)
+
     static func entry(_ id: String) -> LocalAIInboxEntry {
+        if let cached = cache[id] { return cached }
+        var value = LocalAIInboxEntry()
         if let data = UserDefaults.standard.data(forKey: key(id)),
-           let entry = try? JSONDecoder().decode(LocalAIInboxEntry.self, from: data) {
-            return entry
+           let stored = try? JSONDecoder().decode(LocalAIInboxEntry.self, from: data) {
+            value = stored
         }
-        if let data = UserDefaults.standard.data(forKey: "configuredAI.messages.\(id)"),
-           let last = (try? JSONDecoder().decode([LocalAIMessage].self, from: data))?.last {
-            return LocalAIInboxEntry(
-                preview: last.stickerPath != nil ? "[表情包]" :
-                    last.text.replacingOccurrences(of: "\n", with: " "),
-                time: last.createdAt,
-                unreadCount: 0
-            )
-        }
-        return LocalAIInboxEntry()
+        cache[id] = value
+        if value.time == nil { reconcile(id) }
+        return value
     }
 
     static func received(_ message: LocalAIMessage, in id: String) {
@@ -3102,15 +3162,30 @@ private enum LocalAIInbox {
 
     /// Brings the snapshot up to the newest stored message. Some write paths (group member
     /// replies landing after the screen closed, shared chat view persistence) can leave the
-    /// snapshot behind the history, which made the list show a stale preview and time.
+    /// snapshot behind the history. The history blob is only decoded off the main thread and
+    /// only when its size changed since the last check, so calling this often is cheap.
     static func reconcile(_ id: String) {
-        guard let data = UserDefaults.standard.data(forKey: "configuredAI.messages.\(id)"),
-              let last = (try? JSONDecoder().decode([LocalAIMessage].self, from: data))?.last else { return }
-        var value = entry(id)
-        if let time = value.time, time >= last.createdAt { return }
-        value.preview = previewText(last)
-        value.time = last.createdAt
-        save(value, id: id)
+        guard !reconciling.contains(id) else { return }
+        reconciling.insert(id)
+        let known = checkedSize[id]
+        workQueue.async {
+            let data = UserDefaults.standard.data(forKey: "configuredAI.messages.\(id)")
+            let size = data?.count ?? 0
+            var last: LocalAIMessage?
+            if size != known, let data {
+                last = (try? JSONDecoder().decode([LocalAIMessage].self, from: data))?.last
+            }
+            DispatchQueue.main.async {
+                reconciling.remove(id)
+                checkedSize[id] = size
+                guard let last else { return }
+                var value = entry(id)
+                if let time = value.time, time >= last.createdAt { return }
+                value.preview = previewText(last)
+                value.time = last.createdAt
+                save(value, id: id)
+            }
+        }
     }
 
     static func markRead(_ id: String) {
@@ -3120,6 +3195,9 @@ private enum LocalAIInbox {
     }
 
     private static func save(_ value: LocalAIInboxEntry, id: String) {
+        if let old = cache[id], old.preview == value.preview, old.time == value.time,
+           old.unreadCount == value.unreadCount { return }
+        cache[id] = value
         guard let data = try? JSONEncoder().encode(value) else { return }
         UserDefaults.standard.set(data, forKey: key(id))
         UserDefaults.standard.set(
@@ -3130,7 +3208,8 @@ private enum LocalAIInbox {
 }
 
 private enum AIKeychain {
-    private static let service = "app.bearden.mailbox.ai"
+    // Keychain service follows the bundle identifier so differently-identified builds keep separate stores.
+    private static let service = (Bundle.main.bundleIdentifier ?? "app.bearden.mailbox") + ".ai"
 
     static func save(_ value: String, account: String) throws {
         let data = Data(value.utf8)
@@ -4548,6 +4627,11 @@ struct ConversationListView: View {
     @State private var workspacePullTracking = false
     @GestureState private var workspacePullGestureRunning = false
     @State private var conversationListAtTop = true
+    /// When the list last came to rest at the top; a scroll that only just arrived there
+    /// (momentum or the same finger still scrolling up) must not open the workspace.
+    @State private var conversationListAtTopSince = Date.distantPast
+    /// Decided once on the first sample of each drag: nil = undecided, true = may pull.
+    @State private var workspacePullEligible: Bool?
     @State private var showingAddWorkspace = false
     @State private var selectedWorkspaceItem: WorkspaceItem?
     @AppStorage("aiConversationsJSON") private var conversationsJSON = ""
@@ -4683,7 +4767,10 @@ struct ConversationListView: View {
                         .onPreferenceChange(ConversationScrollOffsetKey.self) { value in
                             guard !workspaceLayerVisible else { return }
                             let atTop = value >= -2
-                            if conversationListAtTop != atTop { conversationListAtTop = atTop }
+                            if conversationListAtTop != atTop {
+                                conversationListAtTop = atTop
+                                if atTop { conversationListAtTopSince = Date() }
+                            }
                         }
                         .scrollDisabled(workspaceLayerVisible)
                         .scrollBounceBehavior(.basedOnSize)
@@ -4802,7 +4889,10 @@ struct ConversationListView: View {
         .onChange(of: workspaceOpen) { _, _ in syncRootTabBarVisibility() }
         .onChange(of: workspacePullGestureRunning) { _, running in
             // GestureState also resets when another system gesture cancels the drag.
-            if !running && workspacePullTracking { cancelWorkspacePull() }
+            if !running {
+                workspacePullEligible = nil
+                if workspacePullTracking { cancelWorkspacePull() }
+            }
         }
         .onChange(of: store.hasLoadedInitialMessages) { _, _ in syncClaudeUnreadState() }
         .onChange(of: store.msgs.last?.id) { _, _ in syncClaudeUnreadState() }
@@ -4831,25 +4921,33 @@ struct ConversationListView: View {
             }
             .onChanged { value in
                 guard !workspaceOpen, selectedConversation == nil else { return }
-                if !workspacePullTracking {
-                    guard conversationListAtTop,
-                          search.isEmpty,
-                          value.translation.height > 0,
-                          abs(value.translation.height) > abs(value.translation.width) else { return }
+                // Only a drag that starts while the list is already resting at the top may
+                // pull the workspace; scrolling back up to the top never does.
+                if workspacePullEligible == nil {
+                    workspacePullEligible = conversationListAtTop &&
+                        Date().timeIntervalSince(conversationListAtTopSince) > 0.25 &&
+                        search.isEmpty &&
+                        value.translation.height > 0 &&
+                        abs(value.translation.height) > abs(value.translation.width)
                 }
+                guard workspacePullEligible == true else { return }
+                // The first stretch behaves like the normal list bounce; the layer only
+                // starts to show after the dead zone.
+                let pulled = value.translation.height - Self.workspacePullDeadZone
+                guard workspacePullTracking || pulled > 0 else { return }
                 var transaction = Transaction()
                 transaction.disablesAnimations = true
                 withTransaction(transaction) {
                     workspacePullTracking = true
                     workspaceLayerVisible = true
-                    workspacePullDistance = min(max(value.translation.height * 0.92, 0), 280)
+                    workspacePullDistance = min(max(pulled * 0.92, 0), 280)
                 }
             }
             .onEnded { value in
                 guard workspacePullTracking else { return }
                 workspacePullTracking = false
                 let shouldOpen = !workspaceOpen && search.isEmpty &&
-                    (workspacePullDistance >= 118 || value.predictedEndTranslation.height >= 230)
+                    workspacePullDistance >= Self.workspaceOpenThreshold
                 if shouldOpen {
                     withAnimation(.snappy(duration: 0.42, extraBounce: 0.02)) {
                         workspaceOpen = true
@@ -4863,6 +4961,10 @@ struct ConversationListView: View {
                 }
             }
     }
+
+    /// Pull past the dead zone, then this much more, before releasing opens the workspace.
+    private static let workspacePullDeadZone: CGFloat = 24
+    private static let workspaceOpenThreshold: CGFloat = 80
 
     private func cancelWorkspacePull() {
         workspacePullTracking = false
@@ -4892,7 +4994,8 @@ struct ConversationListView: View {
 
     private func finishWorkspaceCloseDrag(_ distance: CGFloat, _ predictedDistance: CGFloat) {
         guard workspaceOpen else { return }
-        let shouldClose = distance >= 92 || predictedDistance >= 190
+        // A short upward swipe is enough to send the workspace back, like WeChat's mini-program pane.
+        let shouldClose = distance >= 36 || predictedDistance >= 80
         if shouldClose {
             closeWorkspace()
         } else {
@@ -5090,8 +5193,9 @@ struct ConversationListView: View {
     }
 
     private var lastVisibleMessage: Msg? {
-        store.msgs.last(where: {
-            $0.id > UserDefaults.standard.integer(forKey: "claudeHiddenThroughID") &&
+        let hiddenThrough = UserDefaults.standard.integer(forKey: "claudeHiddenThroughID")
+        return store.msgs.last(where: {
+            $0.id > hiddenThrough &&
             !store.isRetracted($0.id) &&
             !$0.text.hasPrefix("【已确认】") &&
             !$0.text.hasPrefix("【已跳过】")
@@ -9816,11 +9920,13 @@ struct ChatView: View {
                 )
             }
 
-            Button {
-                showingAttachments = false
-                showingQuota = true
-            } label: {
-                AttachmentTile(title: "额度", systemImage: "gauge.with.dots.needle.33percent")
+            if ServerConfig.workbenchWebURL != nil {
+                Button {
+                    showingAttachments = false
+                    showingQuota = true
+                } label: {
+                    AttachmentTile(title: "额度", systemImage: "gauge.with.dots.needle.33percent")
+                }
             }
 
             }
