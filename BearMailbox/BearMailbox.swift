@@ -9353,6 +9353,7 @@ struct ChatView: View {
     @State private var approvalSheet: ApprovalSheetItem?
     @State private var panelScrollTask: Task<Void, Never>?
     @State private var draftSaveTask: Task<Void, Never>?
+    @State private var bgLoadTask: Task<Void, Never>?
     @State private var hasMeasuredComposer = false
     @State private var initialScrollReady = false
     @State private var timelineMessages: [Msg] = []
@@ -9608,18 +9609,14 @@ struct ChatView: View {
                 }
                 .task {
                     guard !initialScrollReady else { return }
-                    // Lazy rows, cached images and the composer settle on different layout passes.
-                    // Re-anchor after each pass so the first visit lands on the actual last message.
-                    for delay in [0, 90, 260] {
-                        if delay == 0 {
-                            await Task.yield()
-                            await Task.yield()
-                        } else {
-                            try? await Task.sleep(for: .milliseconds(delay))
-                        }
-                        guard !Task.isCancelled else { return }
-                        jumpWithoutAnimation(proxy, to: bottomAnchor, anchor: .bottom)
-                    }
+                    // 只定位一次：等 Lazy 行、缓存图和输入框几次布局都落定
+                    // （约 260ms）再一次跳到底。之前 0/90/260ms 各跳一次，
+                    // 进页时页面会连抖三下。
+                    await Task.yield()
+                    await Task.yield()
+                    try? await Task.sleep(for: .milliseconds(260))
+                    guard !Task.isCancelled else { return }
+                    jumpWithoutAnimation(proxy, to: bottomAnchor, anchor: .bottom)
                     initialScrollReady = true
                     onReachedLatest()
                 }
@@ -9763,6 +9760,7 @@ struct ChatView: View {
             panelScrollTask?.cancel()
             highlightTask?.cancel()
             draftSaveTask?.cancel()
+            bgLoadTask?.cancel()
             UserDefaults.standard.set(draftBuffer.text, forKey: draftKey)
             markLocalPeerActive(false)
         }
@@ -9852,7 +9850,21 @@ struct ChatView: View {
     }
 
     private func reloadBG() {
-        bgImage = bgVersion > 0 ? UIImage(contentsOfFile: SettingsView.bgPath.path) : nil
+        bgLoadTask?.cancel()
+        guard bgVersion > 0 else {
+            bgImage = nil
+            return
+        }
+        // 背景图从磁盘读 + 解码挪出主线程：进聊天页第一帧不再被一张大图堵住，
+        // 图解好回到主线程再挂上；换背景时取消上一张的加载。
+        bgLoadTask = Task { @MainActor in
+            let image = await Task.detached(priority: .userInitiated) {
+                guard let loaded = UIImage(contentsOfFile: SettingsView.bgPath.path) else { return nil as UIImage? }
+                return loaded.preparingForDisplay()
+            }.value
+            guard !Task.isCancelled else { return }
+            bgImage = image
+        }
     }
 
     private func jumpWithoutAnimation(
