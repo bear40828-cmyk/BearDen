@@ -9328,11 +9328,438 @@ private final class ChatDraftBuffer {
     var text = ""
 }
 
-struct ChatView: View {
+// ===== 输入框独立出来：草稿状态只在这里观测 =====
+// ChatView 原来三十多个 @State 里混着正在输入的草稿，敲一个字整个聊天页
+// body 就跟着跑一遍；现在草稿、表情面板页签、语音按住态都归这个子树所有，
+// 打字只重画输入框这一块，聊天页本身不再被每一次按键触动。
+private struct ChatComposerView: View {
     private enum ReactionPage {
         case emoji
         case stickers
     }
+
+    @State private var draftBuffer = ChatDraftBuffer()
+    @State private var draftSaveTask: Task<Void, Never>?
+    @State private var reactionPage: ReactionPage = .emoji
+    @State private var voicePressActive = false
+
+    let draftKey: String
+    let peerName: String
+    let store: ChatStore
+    let emojis: [String]
+    @ObservedObject var voice: VoiceController
+    @ObservedObject var stickers: StickerLibrary
+    @ObservedObject var locationProvider: OneShotLocationProvider
+    @Binding var replyingTo: Msg?
+    @Binding var pendingAttachments: [PendingAttachment]
+    @Binding var combineAfterSending: Bool
+    @Binding var selectedPhotos: [PhotosPickerItem]
+    @Binding var stickerPhoto: PhotosPickerItem?
+    @Binding var showingAttachments: Bool
+    @Binding var showingReactions: Bool
+    @Binding var showingCamera: Bool
+    @Binding var showingFilePicker: Bool
+    @Binding var showingQuota: Bool
+    @Binding var uploading: Bool
+    @Binding var reEditText: String?
+    var inputFocused: FocusState<Bool>.Binding
+    let onSend: (String, @escaping (String) -> Void) -> Void
+    let onHeightChange: (CGFloat) -> Void
+    let onVoiceError: (String) -> Void
+    let onSendSticker: (LocalSticker) -> Void
+    let onStagePhotos: ([PhotosPickerItem]) -> Void
+
+    private var canCombinePendingImages: Bool {
+        pendingAttachments.count >= 2 && pendingAttachments.allSatisfy(\.isImage)
+    }
+
+    var body: some View {
+        composerContent
+            .background {
+                GeometryReader { geometry in
+                    Color.clear.preference(
+                        key: ComposerHeightPreferenceKey.self,
+                        value: geometry.size.height
+                    )
+                }
+            }
+            .onPreferenceChange(ComposerHeightPreferenceKey.self) { height in
+                onHeightChange(height)
+            }
+            .onAppear {
+                if draftBuffer.text.isEmpty {
+                    draftBuffer.text = UserDefaults.standard.string(forKey: draftKey) ?? ""
+                }
+            }
+            .onDisappear {
+                draftSaveTask?.cancel()
+                UserDefaults.standard.set(draftBuffer.text, forKey: draftKey)
+            }
+            .onChange(of: draftBuffer.text) { _, text in
+                store.pingTyping(text)
+                draftSaveTask?.cancel()
+                draftSaveTask = Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(350))
+                    guard !Task.isCancelled else { return }
+                    UserDefaults.standard.set(text, forKey: draftKey)
+                }
+            }
+            .onChange(of: reEditText) { _, text in
+                guard let text else { return }
+                draftBuffer.text = text
+                replyingTo = nil
+                inputFocused.wrappedValue = true
+                reEditText = nil
+            }
+    }
+
+    private func sendDraft(_ text: String) {
+        onSend(text) { raw in
+            if draftBuffer.text.isEmpty { draftBuffer.text = raw }
+        }
+    }
+
+    private var composerContent: some View {
+        VStack(spacing: 10) {
+            if let replyingTo {
+                ChatReplyComposerCard(
+                    title: "回复 \(replyingTo.from == "me" ? "我" : peerName)",
+                    preview: replyingTo.previewText
+                ) {
+                    withAnimation(.easeOut(duration: 0.16)) { self.replyingTo = nil }
+                }
+            }
+
+            if !pendingAttachments.isEmpty {
+                pendingAttachmentTray
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+
+            ChatInputRow(
+                buffer: draftBuffer,
+                inputFocused: inputFocused,
+                isRecording: voice.isRecording,
+                isTranscribing: voice.isTranscribing,
+                uploading: uploading,
+                hasAttachments: !pendingAttachments.isEmpty,
+                showingReactions: showingReactions,
+                onVoiceTap: toggleTranscription,
+                onHoldStart: beginVoicePress,
+                onHoldEnd: endVoicePress,
+                onToggleReactions: {
+                    inputFocused.wrappedValue = false
+                    showingAttachments = false
+                    withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
+                        showingReactions.toggle()
+                    }
+                },
+                onOpenAttachments: {
+                    inputFocused.wrappedValue = false
+                    showingReactions = false
+                    withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
+                        showingAttachments.toggle()
+                    }
+                },
+                onSend: sendDraft
+            )
+
+            if showingAttachments {
+                attachmentPanel
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+
+            if showingReactions {
+                reactionPanel
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.top, 8)
+        .padding(.bottom, 5)
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 18)
+                .onChanged { value in
+                    guard (showingAttachments || showingReactions),
+                          value.startLocation.y > 50,
+                          value.translation.height > 48,
+                          value.translation.height > abs(value.translation.width) * 1.2 else { return }
+                    withAnimation(.easeOut(duration: 0.18)) {
+                        showingAttachments = false
+                        showingReactions = false
+                    }
+                }
+        )
+        .onChange(of: selectedPhotos) { _, items in
+            guard !items.isEmpty else { return }
+            selectedPhotos = []
+            showingAttachments = false
+            onStagePhotos(items)
+        }
+        .onChange(of: stickerPhoto) { _, item in
+            guard let item else { return }
+            stickerPhoto = nil
+            Task {
+                guard let data = try? await item.loadTransferable(type: Data.self) else { return }
+                await MainActor.run {
+                    stickers.add(data: data)
+                }
+            }
+        }
+    }
+
+    private var pendingAttachmentTray: some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 10) {
+                Text("待发送 \(pendingAttachments.count)")
+                    .font(.system(size: 13, weight: .semibold))
+                Spacer()
+                if canCombinePendingImages {
+                    PendingCombineToggle(isOn: $combineAfterSending)
+                }
+            }
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(pendingAttachments) { item in
+                        PendingAttachmentCard(item: item) {
+                            withAnimation(.easeOut(duration: 0.18)) {
+                                pendingAttachments.removeAll { $0.id == item.id }
+                                if !canCombinePendingImages { combineAfterSending = false }
+                            }
+                        }
+                    }
+                }
+                .padding(.horizontal, 2)
+            }
+        }
+        .padding(10)
+        .modifier(BubbleGlass(shape: RoundedRectangle(cornerRadius: 24, style: .continuous)))
+    }
+
+    private var attachmentPanel: some View {
+        VStack(spacing: 3) {
+            panelHandle
+            HStack(spacing: 0) {
+                PhotosPicker(selection: $selectedPhotos, maxSelectionCount: 9, matching: .any(of: [.images, .videos])) {
+                    AttachmentTile(title: "照片", systemImage: "photo")
+                }
+
+            Button {
+                guard UIImagePickerController.isSourceTypeAvailable(.camera) else { return }
+                showingAttachments = false
+                showingCamera = true
+            } label: {
+                AttachmentTile(title: "拍摄", systemImage: "camera.fill")
+            }
+
+            Button {
+                showingAttachments = false
+                showingFilePicker = true
+            } label: {
+                AttachmentTile(title: "文件", systemImage: "folder.fill")
+            }
+
+            Button {
+                showingAttachments = false
+                locationProvider.request { location in
+                    Task {
+                        await store.send(LocationInfo.encode(
+                            latitude: location.coordinate.latitude,
+                            longitude: location.coordinate.longitude
+                        ))
+                    }
+                }
+            } label: {
+                AttachmentTile(
+                    title: locationProvider.isLocating ? "定位中" : "位置",
+                    systemImage: "location.fill"
+                )
+            }
+
+            if ServerConfig.workbenchWebURL != nil {
+                Button {
+                    showingAttachments = false
+                    showingQuota = true
+                } label: {
+                    AttachmentTile(title: "额度", systemImage: "gauge.with.dots.needle.33percent")
+                }
+            }
+
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 8)
+        .padding(.bottom, 10)
+        .modifier(BubbleGlass(shape: RoundedRectangle(cornerRadius: 28, style: .continuous)))
+    }
+
+    private var reactionPanel: some View {
+        VStack(spacing: 10) {
+            panelHandle
+            HStack(spacing: 10) {
+                reactionTab(title: "Emoji", systemImage: "face.smiling", page: .emoji)
+                reactionTab(title: "表情包", systemImage: "heart", page: .stickers)
+                Spacer()
+            }
+
+            Divider().opacity(0.22)
+
+            ScrollView {
+                if reactionPage == .emoji {
+                    LazyVGrid(
+                        columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 7),
+                        spacing: 12
+                    ) {
+                        ForEach(emojis, id: \.self) { emoji in
+                            Button {
+                                draftBuffer.text.append(emoji)
+                            } label: {
+                                Text(emoji)
+                                    .font(.system(size: 29))
+                                    .frame(maxWidth: .infinity, minHeight: 46)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.horizontal, 4)
+                } else {
+                    LazyVGrid(
+                        columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 4),
+                        spacing: 10
+                    ) {
+                        PhotosPicker(selection: $stickerPhoto, matching: .images) {
+                            VStack(spacing: 4) {
+                                Image(systemName: "plus")
+                                    .font(.system(size: 24, weight: .medium))
+                                Text("添加")
+                                    .font(.system(size: 11, weight: .medium))
+                            }
+                            .frame(maxWidth: .infinity)
+                            .aspectRatio(1, contentMode: .fit)
+                            .background(Color.white.opacity(0.16), in: RoundedRectangle(cornerRadius: 15, style: .continuous))
+                        }
+                        .buttonStyle(.plain)
+
+                        ForEach(stickers.items) { sticker in
+                            Button {
+                                onSendSticker(sticker)
+                            } label: {
+                                StickerThumbnail(url: sticker.url)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.horizontal, 4)
+                }
+            }
+            .frame(height: 220)
+        }
+        .padding(12)
+        .modifier(BubbleGlass(shape: RoundedRectangle(cornerRadius: 28, style: .continuous)))
+    }
+
+    private var panelHandle: some View {
+        Capsule()
+            .fill(Color.primary.opacity(0.25))
+            .frame(width: 38, height: 5)
+            .frame(maxWidth: .infinity)
+            .frame(height: 24)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                closeOpenPanel()
+            }
+            .gesture(
+                DragGesture(minimumDistance: 8)
+                    .onChanged { value in
+                        if value.translation.height > 28 {
+                            closeOpenPanel()
+                        }
+                    }
+            )
+    }
+
+    private func closeOpenPanel() {
+        guard showingAttachments || showingReactions else { return }
+        withAnimation(.easeOut(duration: 0.18)) {
+            showingAttachments = false
+            showingReactions = false
+        }
+    }
+
+    private func reactionTab(
+        title: String,
+        systemImage: String,
+        page: ReactionPage
+    ) -> some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.18)) {
+                reactionPage = page
+            }
+        } label: {
+            Label(title, systemImage: systemImage)
+                .font(.system(size: 14, weight: .semibold))
+                .padding(.horizontal, 13)
+                .padding(.vertical, 8)
+                .background(
+                    reactionPage == page ? Color.white.opacity(0.25) : Color.clear,
+                    in: Capsule()
+                )
+                .frame(minHeight: 44)
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func toggleTranscription() {
+        inputFocused.wrappedValue = false
+        if voice.isTranscribing {
+            voice.stopTranscription()
+        } else {
+            showingReactions = false
+            showingAttachments = false
+            let existing = draftBuffer.text
+            Task {
+                do { try await voice.startTranscription { draftBuffer.text = existing + $0 } }
+                catch { onVoiceError(error.localizedDescription) }
+            }
+        }
+    }
+
+    private func beginVoicePress() {
+        inputFocused.wrappedValue = false
+        voice.stopTranscription()
+        showingReactions = false
+        showingAttachments = false
+        voicePressActive = true
+        Task {
+            do {
+                try await voice.startRecording(shouldStart: { voicePressActive })
+            } catch {
+                onVoiceError(error.localizedDescription)
+            }
+        }
+    }
+
+    private func endVoicePress() {
+        voicePressActive = false
+        guard let url = voice.finishRecording() else { return }
+        Task {
+            uploading = true
+            defer { uploading = false }
+            guard let data = try? Data(contentsOf: url) else { return }
+            defer { try? FileManager.default.removeItem(at: url) }
+            if let saved = await store.upload(data, name: url.lastPathComponent) {
+                await store.send("", file: saved)
+            } else {
+                onVoiceError("语音上传失败，请重试。")
+            }
+        }
+    }
+
+}
+
+struct ChatView: View {
 
     @ObservedObject var store: ChatStore
     @Binding var isPinned: Bool
@@ -9341,7 +9768,6 @@ struct ChatView: View {
     let unreadStartMessageID: Int?
     let onReachedLatest: () -> Void
     @StateObject private var voice = VoiceController()
-    @State private var voicePressActive = false
     @State private var voiceError: String?
     @State private var jumpToMessageID: Int?
     @State private var highlightedMessageID: Int?
@@ -9349,6 +9775,7 @@ struct ChatView: View {
     @State private var selectedMessageID: Int?
     @State private var reactionTargetID: Int?
     @State private var replyingTo: Msg?
+    @State private var reEditText: String?
     @State private var showingPatEditor = false
     @State private var approvalSheet: ApprovalSheetItem?
     @State private var panelScrollTask: Task<Void, Never>?
@@ -9365,7 +9792,6 @@ struct ChatView: View {
     @StateObject private var locationProvider = OneShotLocationProvider()
     @StateObject private var stickers = StickerLibrary()
     @FocusState private var inputFocused: Bool
-    @State private var draftBuffer = ChatDraftBuffer()
     @State private var selectedPhotos: [PhotosPickerItem] = []
     @State private var pendingAttachments: [PendingAttachment] = []
     @State private var combineAfterSending = false
@@ -9380,7 +9806,6 @@ struct ChatView: View {
     @State private var showingFilePicker = false
     @State private var showingChatDetails = false
     @State private var showingQuota = false
-    @State private var reactionPage: ReactionPage = .emoji
     @AppStorage("bgVersion") private var bgVersion = 0
     @State private var bgImage: UIImage?
 
@@ -9407,9 +9832,6 @@ struct ChatView: View {
         "❤️", "💗", "✨", "🎉", "🔥", "🌚", "🫪"
     ]
 
-    private var canCombinePendingImages: Bool {
-        pendingAttachments.count >= 2 && pendingAttachments.allSatisfy(\.isImage)
-    }
 
     private func refreshTimeline(_ source: [Msg]? = nil) {
         // Run on message/history changes, never on each composer keystroke.
@@ -9563,9 +9985,7 @@ struct ChatView: View {
                             bottomInset: composerHeight + 1,
                             retractedIDs: store.retractedMessageIDs,
                             onReEdit: { message in
-                                draftBuffer.text = message.displayedText
-                                replyingTo = nil
-                                inputFocused = true
+                                reEditText = message.displayedText
                             },
                             forwardedIDs: store.forwardedMessageIDs
                         )
@@ -9587,25 +10007,42 @@ struct ChatView: View {
                         selectedMessageID = nil
                     }
 
-                    composer
-                        .background {
-                            GeometryReader { geometry in
-                                Color.clear.preference(
-                                    key: ComposerHeightPreferenceKey.self,
-                                    value: geometry.size.height
-                                )
+                    ChatComposerView(
+                        draftKey: draftKey,
+                        peerName: peerName,
+                        store: store,
+                        emojis: emojis,
+                        voice: voice,
+                        stickers: stickers,
+                        locationProvider: locationProvider,
+                        replyingTo: $replyingTo,
+                        pendingAttachments: $pendingAttachments,
+                        combineAfterSending: $combineAfterSending,
+                        selectedPhotos: $selectedPhotos,
+                        stickerPhoto: $stickerPhoto,
+                        showingAttachments: $showingAttachments,
+                        showingReactions: $showingReactions,
+                        showingCamera: $showingCamera,
+                        showingFilePicker: $showingFilePicker,
+                        showingQuota: $showingQuota,
+                        uploading: $uploading,
+                        reEditText: $reEditText,
+                        inputFocused: $inputFocused,
+                        onSend: { text, restore in sendDraft(text, restoreDraft: restore) },
+                        onHeightChange: { height in
+                            guard height > 0, abs(height - composerHeight) > 0.5 else { return }
+                            composerHeight = height
+                            // 输入框换行只改底边距，不贴底滚动：贴底由 sizeChanges 锚点自己处理，
+                            // 再 scrollTo 会把正在往上翻的人一把拽到底，打字时页面一跳。
+                            if !hasMeasuredComposer {
+                                hasMeasuredComposer = true
+                                if initialScrollReady { followPanel(proxy) }
                             }
-                        }
-                }
-                .onPreferenceChange(ComposerHeightPreferenceKey.self) { height in
-                    guard height > 0, abs(height - composerHeight) > 0.5 else { return }
-                    composerHeight = height
-                    // 输入框换行只改底边距，不贴底滚动：贴底由 sizeChanges 锚点自己处理，
-                    // 再 scrollTo 会把正在往上翻的人一把拽到底，打字时页面一跳。
-                    if !hasMeasuredComposer {
-                        hasMeasuredComposer = true
-                        if initialScrollReady { followPanel(proxy) }
-                    }
+                        },
+                        onVoiceError: { voiceError = $0 },
+                        onSendSticker: { sticker in sendSticker(sticker) },
+                        onStagePhotos: { items in stagePhotos(items) }
+                    )
                 }
                 .task {
                     guard !initialScrollReady else { return }
@@ -9749,9 +10186,6 @@ struct ChatView: View {
             store.start()
             refreshTimeline()
             reloadBG()
-            if draftBuffer.text.isEmpty {
-                draftBuffer.text = UserDefaults.standard.string(forKey: draftKey) ?? ""
-            }
             markLocalPeerActive(true)
         }
         .onDisappear {
@@ -9761,17 +10195,7 @@ struct ChatView: View {
             highlightTask?.cancel()
             draftSaveTask?.cancel()
             bgLoadTask?.cancel()
-            UserDefaults.standard.set(draftBuffer.text, forKey: draftKey)
             markLocalPeerActive(false)
-        }
-        .onChange(of: draftBuffer.text) { _, text in
-            store.pingTyping(text)
-            draftSaveTask?.cancel()
-            draftSaveTask = Task { @MainActor in
-                try? await Task.sleep(for: .milliseconds(350))
-                guard !Task.isCancelled else { return }
-                UserDefaults.standard.set(text, forKey: draftKey)
-            }
         }
         .onReceive(store.$msgs) { messages in refreshTimeline(messages) }
         .onReceive(store.$retractedMessageIDs) { _ in
@@ -9895,345 +10319,7 @@ struct ChatView: View {
         }
     }
 
-    private var composer: some View {
-        VStack(spacing: 10) {
-            if let replyingTo {
-                ChatReplyComposerCard(
-                    title: "回复 \(replyingTo.from == "me" ? "我" : peerName)",
-                    preview: replyingTo.previewText
-                ) {
-                    withAnimation(.easeOut(duration: 0.16)) { self.replyingTo = nil }
-                }
-            }
-
-            if !pendingAttachments.isEmpty {
-                pendingAttachmentTray
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
-            }
-
-            ChatInputRow(
-                buffer: draftBuffer,
-                inputFocused: $inputFocused,
-                isRecording: voice.isRecording,
-                isTranscribing: voice.isTranscribing,
-                uploading: uploading,
-                hasAttachments: !pendingAttachments.isEmpty,
-                showingReactions: showingReactions,
-                onVoiceTap: toggleTranscription,
-                onHoldStart: beginVoicePress,
-                onHoldEnd: endVoicePress,
-                onToggleReactions: {
-                    inputFocused = false
-                    showingAttachments = false
-                    withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
-                        showingReactions.toggle()
-                    }
-                },
-                onOpenAttachments: {
-                    inputFocused = false
-                    showingReactions = false
-                    withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
-                        showingAttachments.toggle()
-                    }
-                },
-                onSend: sendDraft
-            )
-
-            if showingAttachments {
-                attachmentPanel
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
-            }
-
-            if showingReactions {
-                reactionPanel
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
-            }
-        }
-        .padding(.horizontal, 10)
-        .padding(.top, 8)
-        .padding(.bottom, 5)
-        .simultaneousGesture(
-            DragGesture(minimumDistance: 18)
-                .onChanged { value in
-                    guard (showingAttachments || showingReactions),
-                          value.startLocation.y > 50,
-                          value.translation.height > 48,
-                          value.translation.height > abs(value.translation.width) * 1.2 else { return }
-                    withAnimation(.easeOut(duration: 0.18)) {
-                        showingAttachments = false
-                        showingReactions = false
-                    }
-                }
-        )
-        .onChange(of: selectedPhotos) { _, items in
-            guard !items.isEmpty else { return }
-            selectedPhotos = []
-            showingAttachments = false
-            stagePhotos(items)
-        }
-        .onChange(of: stickerPhoto) { _, item in
-            guard let item else { return }
-            stickerPhoto = nil
-            Task {
-                guard let data = try? await item.loadTransferable(type: Data.self) else { return }
-                await MainActor.run {
-                    stickers.add(data: data)
-                }
-            }
-        }
-    }
-
-    private var pendingAttachmentTray: some View {
-        VStack(spacing: 8) {
-            HStack(spacing: 10) {
-                Text("待发送 \(pendingAttachments.count)")
-                    .font(.system(size: 13, weight: .semibold))
-                Spacer()
-                if canCombinePendingImages {
-                    PendingCombineToggle(isOn: $combineAfterSending)
-                }
-            }
-
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    ForEach(pendingAttachments) { item in
-                        PendingAttachmentCard(item: item) {
-                            withAnimation(.easeOut(duration: 0.18)) {
-                                pendingAttachments.removeAll { $0.id == item.id }
-                                if !canCombinePendingImages { combineAfterSending = false }
-                            }
-                        }
-                    }
-                }
-                .padding(.horizontal, 2)
-            }
-        }
-        .padding(10)
-        .modifier(BubbleGlass(shape: RoundedRectangle(cornerRadius: 24, style: .continuous)))
-    }
-
-    private var attachmentPanel: some View {
-        VStack(spacing: 3) {
-            panelHandle
-            HStack(spacing: 0) {
-                PhotosPicker(selection: $selectedPhotos, maxSelectionCount: 9, matching: .any(of: [.images, .videos])) {
-                    AttachmentTile(title: "照片", systemImage: "photo")
-                }
-
-            Button {
-                guard UIImagePickerController.isSourceTypeAvailable(.camera) else { return }
-                showingAttachments = false
-                showingCamera = true
-            } label: {
-                AttachmentTile(title: "拍摄", systemImage: "camera.fill")
-            }
-
-            Button {
-                showingAttachments = false
-                showingFilePicker = true
-            } label: {
-                AttachmentTile(title: "文件", systemImage: "folder.fill")
-            }
-
-            Button {
-                showingAttachments = false
-                locationProvider.request { location in
-                    Task {
-                        await store.send(LocationInfo.encode(
-                            latitude: location.coordinate.latitude,
-                            longitude: location.coordinate.longitude
-                        ))
-                    }
-                }
-            } label: {
-                AttachmentTile(
-                    title: locationProvider.isLocating ? "定位中" : "位置",
-                    systemImage: "location.fill"
-                )
-            }
-
-            if ServerConfig.workbenchWebURL != nil {
-                Button {
-                    showingAttachments = false
-                    showingQuota = true
-                } label: {
-                    AttachmentTile(title: "额度", systemImage: "gauge.with.dots.needle.33percent")
-                }
-            }
-
-            }
-            .buttonStyle(.plain)
-        }
-        .padding(.horizontal, 8)
-        .padding(.bottom, 10)
-        .modifier(BubbleGlass(shape: RoundedRectangle(cornerRadius: 28, style: .continuous)))
-    }
-
-    private var reactionPanel: some View {
-        VStack(spacing: 10) {
-            panelHandle
-            HStack(spacing: 10) {
-                reactionTab(title: "Emoji", systemImage: "face.smiling", page: .emoji)
-                reactionTab(title: "表情包", systemImage: "heart", page: .stickers)
-                Spacer()
-            }
-
-            Divider().opacity(0.22)
-
-            ScrollView {
-                if reactionPage == .emoji {
-                    LazyVGrid(
-                        columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 7),
-                        spacing: 12
-                    ) {
-                        ForEach(emojis, id: \.self) { emoji in
-                            Button {
-                                draftBuffer.text.append(emoji)
-                            } label: {
-                                Text(emoji)
-                                    .font(.system(size: 29))
-                                    .frame(maxWidth: .infinity, minHeight: 46)
-                                    .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                    .padding(.horizontal, 4)
-                } else {
-                    LazyVGrid(
-                        columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 4),
-                        spacing: 10
-                    ) {
-                        PhotosPicker(selection: $stickerPhoto, matching: .images) {
-                            VStack(spacing: 4) {
-                                Image(systemName: "plus")
-                                    .font(.system(size: 24, weight: .medium))
-                                Text("添加")
-                                    .font(.system(size: 11, weight: .medium))
-                            }
-                            .frame(maxWidth: .infinity)
-                            .aspectRatio(1, contentMode: .fit)
-                            .background(Color.white.opacity(0.16), in: RoundedRectangle(cornerRadius: 15, style: .continuous))
-                        }
-                        .buttonStyle(.plain)
-
-                        ForEach(stickers.items) { sticker in
-                            Button {
-                                sendSticker(sticker)
-                            } label: {
-                                StickerThumbnail(url: sticker.url)
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                    .padding(.horizontal, 4)
-                }
-            }
-            .frame(height: 220)
-        }
-        .padding(12)
-        .modifier(BubbleGlass(shape: RoundedRectangle(cornerRadius: 28, style: .continuous)))
-    }
-
-    private var panelHandle: some View {
-        Capsule()
-            .fill(Color.primary.opacity(0.25))
-            .frame(width: 38, height: 5)
-            .frame(maxWidth: .infinity)
-            .frame(height: 24)
-            .contentShape(Rectangle())
-            .onTapGesture {
-                closeOpenPanel()
-            }
-            .gesture(
-                DragGesture(minimumDistance: 8)
-                    .onChanged { value in
-                        if value.translation.height > 28 {
-                            closeOpenPanel()
-                        }
-                    }
-            )
-    }
-
-    private func closeOpenPanel() {
-        guard showingAttachments || showingReactions else { return }
-        withAnimation(.easeOut(duration: 0.18)) {
-            showingAttachments = false
-            showingReactions = false
-        }
-    }
-
-    private func reactionTab(
-        title: String,
-        systemImage: String,
-        page: ReactionPage
-    ) -> some View {
-        Button {
-            withAnimation(.easeInOut(duration: 0.18)) {
-                reactionPage = page
-            }
-        } label: {
-            Label(title, systemImage: systemImage)
-                .font(.system(size: 14, weight: .semibold))
-                .padding(.horizontal, 13)
-                .padding(.vertical, 8)
-                .background(
-                    reactionPage == page ? Color.white.opacity(0.25) : Color.clear,
-                    in: Capsule()
-                )
-                .frame(minHeight: 44)
-                .contentShape(Capsule())
-        }
-        .buttonStyle(.plain)
-    }
-
-    private func toggleTranscription() {
-        inputFocused = false
-        if voice.isTranscribing {
-            voice.stopTranscription()
-        } else {
-            showingReactions = false
-            showingAttachments = false
-            let existing = draftBuffer.text
-            Task {
-                do { try await voice.startTranscription { draftBuffer.text = existing + $0 } }
-                catch { voiceError = error.localizedDescription }
-            }
-        }
-    }
-
-    private func beginVoicePress() {
-        inputFocused = false
-        voice.stopTranscription()
-        showingReactions = false
-        showingAttachments = false
-        voicePressActive = true
-        Task {
-            do {
-                try await voice.startRecording(shouldStart: { voicePressActive })
-            } catch {
-                voiceError = error.localizedDescription
-            }
-        }
-    }
-
-    private func endVoicePress() {
-        voicePressActive = false
-        guard let url = voice.finishRecording() else { return }
-        Task {
-            uploading = true
-            defer { uploading = false }
-            guard let data = try? Data(contentsOf: url) else { return }
-            defer { try? FileManager.default.removeItem(at: url) }
-            if let saved = await store.upload(data, name: url.lastPathComponent) {
-                await store.send("", file: saved)
-            } else {
-                voiceError = "语音上传失败，请重试。"
-            }
-        }
-    }
-
-    private func sendDraft(_ rawText: String) {
+    private func sendDraft(_ rawText: String, restoreDraft: @escaping (String) -> Void) {
         guard !uploading else { return }
         let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
         let attachments = pendingAttachments
@@ -10263,7 +10349,7 @@ struct ChatView: View {
             if attachments.isEmpty {
                 if !(await store.send(payload(text))) {
                     if replyingTo == nil { replyingTo = replyTarget }
-                    if draftBuffer.text.isEmpty { draftBuffer.text = rawText }
+                    restoreDraft(rawText)
                     attachmentError = "消息发送未确认，请检查网络和聊天记录后重试。"
                 }
                 return
@@ -10281,7 +10367,7 @@ struct ChatView: View {
                 pendingAttachments.insert(contentsOf: attachments, at: 0)
                 combineAfterSending = shouldCombine
                 if replyingTo == nil { replyingTo = replyTarget }
-                if draftBuffer.text.isEmpty { draftBuffer.text = rawText }
+                restoreDraft(rawText)
                 attachmentError = "附件上传未完成，图片和文字已保留，可以重试。"
                 return
             }
@@ -10319,7 +10405,7 @@ struct ChatView: View {
             pendingAttachments.insert(contentsOf: failed, at: 0)
             if !captionSent {
                 if replyingTo == nil { replyingTo = replyTarget }
-                if draftBuffer.text.isEmpty { draftBuffer.text = rawText }
+                restoreDraft(rawText)
             }
             if sentIDs.count < attachments.count {
                 combineAfterSending = shouldCombine && pendingAttachments.count >= 2
