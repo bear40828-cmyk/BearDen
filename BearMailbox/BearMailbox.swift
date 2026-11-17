@@ -10020,6 +10020,194 @@ struct ChatView: View {
         ZStack {
             chatBackground
             if store.hasLoadedInitialMessages || !store.msgs.isEmpty {
+                chatMainArea(geo: geo)
+            } else {
+                ProgressView()
+                    .controlSize(.large)
+                    .tint(.primary.opacity(0.58))
+            }
+        }
+        }
+        .ignoresSafeArea(edges: .top)
+        .navigationBarTitleDisplayMode(.inline)
+        .navigationBarBackButtonHidden(false)
+        .toolbarBackground(.hidden, for: .navigationBar)
+        .toolbar(.hidden, for: .tabBar)
+        .toolbar {
+            ToolbarItem(placement: .principal) {
+                VStack(spacing: 1) {
+                    Text(peerName)
+                        .font(.system(size: 15, weight: .semibold))
+                        .lineLimit(1)
+                    Text(peerStatus)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(store.isPeerTyping ? Color.pink.opacity(0.82) : Color.secondary)
+                }
+                .padding(.horizontal, 18)
+                .padding(.vertical, 7)
+                .modifier(Glass(shape: Capsule()))
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    showingChatDetails = true
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 17, weight: .bold))
+                        .frame(width: 42, height: 42)
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("聊天详情")
+            }
+        }
+
+        .alert("语音", isPresented: Binding(
+            get: { voiceError != nil },
+            set: { if !$0 { voiceError = nil } }
+        )) {
+            Button("好") { voiceError = nil }
+        } message: {
+            Text(voiceError ?? "")
+        }
+        .alert("附件", isPresented: Binding(
+            get: { attachmentError != nil },
+            set: { if !$0 { attachmentError = nil } }
+        )) {
+            Button("好") { attachmentError = nil }
+        } message: {
+            Text(attachmentError ?? "")
+        }
+        .alert("撤回", isPresented: Binding(
+            get: { retractNotice != nil },
+            set: { if !$0 { retractNotice = nil } }
+        )) {
+            Button("好") { retractNotice = nil }
+        } message: {
+            Text(retractNotice ?? "")
+        }
+        .onAppear {
+            store.start()
+            refreshTimeline()
+            reloadBG()
+            markLocalPeerActive(true)
+        }
+        .onDisappear {
+            store.stop()
+            voice.stopTranscription()
+            panelScrollTask?.cancel()
+            highlightTask?.cancel()
+            draftSaveTask?.cancel()
+            bgLoadTask?.cancel()
+            markLocalPeerActive(false)
+        }
+        .onReceive(store.$msgs) { messages in refreshTimeline(messages) }
+        .onReceive(store.$retractedMessageIDs) { _ in
+            // @Published emits before storage changes.
+            Task { @MainActor in refreshTimeline() }
+        }
+        .onReceive(store.$hiddenMessageIDs) { _ in
+            Task { @MainActor in refreshTimeline() }
+        }
+        .onChange(of: hiddenThroughID) { _, _ in refreshTimeline() }
+        .onChange(of: bgVersion) { _, _ in reloadBG() }
+        .sheet(isPresented: $showingPatEditor) {
+            PatSettingsView(suffix: $patSuffix)
+                .presentationDetents([.height(330)])
+                .presentationDragIndicator(.visible)
+        }
+
+        .sheet(item: $approvalSheet) { item in
+            ApprovalSheetView(store: store, item: item)
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+        }
+        .sheet(isPresented: Binding(
+            get: { reactionTargetID != nil },
+            set: { if !$0 { reactionTargetID = nil } }
+        )) {
+            ReactionPickerView(emojis: emojis) { emoji in
+                if let reactionTargetID {
+                    store.toggleReaction(emoji, for: reactionTargetID)
+                }
+                self.reactionTargetID = nil
+            }
+            .presentationDetents([.height(330)])
+            .presentationDragIndicator(.visible)
+            .presentationBackground(.ultraThickMaterial)
+        }
+    }
+
+    private var chatBackground: some View {
+        Group {
+            if let bg = bgImage {
+                GeometryReader { geo in
+                    Image(uiImage: bg)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: geo.size.width, height: geo.size.height)
+                        .clipped()
+                }
+                .overlay(Color.black.opacity(0.025))
+                .ignoresSafeArea()
+            } else {
+                ZStack {
+                    LinearGradient(
+                        colors: [
+                            Color(red: 1.00, green: 0.90, blue: 0.95),
+                            Color(red: 0.91, green: 0.88, blue: 1.00),
+                            Color(red: 1.00, green: 0.96, blue: 0.90)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                    Circle()
+                        .fill(Color.pink.opacity(0.26))
+                        .frame(width: 260, height: 260)
+                        .blur(radius: 45)
+                        .offset(x: 130, y: -250)
+                    Circle()
+                        .fill(Color.purple.opacity(0.18))
+                        .frame(width: 300, height: 300)
+                        .blur(radius: 55)
+                        .offset(x: -150, y: 260)
+                }
+                .ignoresSafeArea()
+            }
+        }
+    }
+
+    private func reloadBG() {
+        bgLoadTask?.cancel()
+        guard bgVersion > 0 else {
+            bgImage = nil
+            return
+        }
+        // 背景图从磁盘读 + 解码挪出主线程：进聊天页第一帧不再被一张大图堵住，
+        // 图解好回到主线程再挂上；换背景时取消上一张的加载。
+        bgLoadTask = Task { @MainActor in
+            let image = await Task.detached(priority: .userInitiated) {
+                guard let loaded = UIImage(contentsOfFile: SettingsView.bgPath.path) else { return nil as UIImage? }
+                return loaded.preparingForDisplay()
+            }.value
+            guard !Task.isCancelled else { return }
+            bgImage = image
+        }
+    }
+
+    private func jumpWithoutAnimation(
+        _ proxy: ScrollViewProxy,
+        to id: some Hashable,
+        anchor: UnitPoint
+    ) {
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            proxy.scrollTo(id, anchor: anchor)
+        }
+    }
+
+    @ViewBuilder
+    private func chatMainArea(geo: GeometryProxy) -> some View {
                 ScrollViewReader { proxy in
                 ZStack(alignment: .bottom) {
                     // List 直接撑满：之前外层还套着 ScrollView，List 在竖向
@@ -10256,189 +10444,6 @@ struct ChatView: View {
                     stageFiles(urls)
                 }
             }
-            } else {
-                ProgressView()
-                    .controlSize(.large)
-                    .tint(.primary.opacity(0.58))
-            }
-        }
-        }
-        .ignoresSafeArea(edges: .top)
-        .navigationBarTitleDisplayMode(.inline)
-        .navigationBarBackButtonHidden(false)
-        .toolbarBackground(.hidden, for: .navigationBar)
-        .toolbar(.hidden, for: .tabBar)
-        .toolbar {
-            ToolbarItem(placement: .principal) {
-                VStack(spacing: 1) {
-                    Text(peerName)
-                        .font(.system(size: 15, weight: .semibold))
-                        .lineLimit(1)
-                    Text(peerStatus)
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(store.isPeerTyping ? Color.pink.opacity(0.82) : Color.secondary)
-                }
-                .padding(.horizontal, 18)
-                .padding(.vertical, 7)
-                .modifier(Glass(shape: Capsule()))
-            }
-            ToolbarItem(placement: .topBarTrailing) {
-                Button {
-                    showingChatDetails = true
-                } label: {
-                    Image(systemName: "ellipsis")
-                        .font(.system(size: 17, weight: .bold))
-                        .frame(width: 42, height: 42)
-                        .contentShape(Circle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("聊天详情")
-            }
-        }
-
-        .alert("语音", isPresented: Binding(
-            get: { voiceError != nil },
-            set: { if !$0 { voiceError = nil } }
-        )) {
-            Button("好") { voiceError = nil }
-        } message: {
-            Text(voiceError ?? "")
-        }
-        .alert("附件", isPresented: Binding(
-            get: { attachmentError != nil },
-            set: { if !$0 { attachmentError = nil } }
-        )) {
-            Button("好") { attachmentError = nil }
-        } message: {
-            Text(attachmentError ?? "")
-        }
-        .alert("撤回", isPresented: Binding(
-            get: { retractNotice != nil },
-            set: { if !$0 { retractNotice = nil } }
-        )) {
-            Button("好") { retractNotice = nil }
-        } message: {
-            Text(retractNotice ?? "")
-        }
-        .onAppear {
-            store.start()
-            refreshTimeline()
-            reloadBG()
-            markLocalPeerActive(true)
-        }
-        .onDisappear {
-            store.stop()
-            voice.stopTranscription()
-            panelScrollTask?.cancel()
-            highlightTask?.cancel()
-            draftSaveTask?.cancel()
-            bgLoadTask?.cancel()
-            markLocalPeerActive(false)
-        }
-        .onReceive(store.$msgs) { messages in refreshTimeline(messages) }
-        .onReceive(store.$retractedMessageIDs) { _ in
-            // @Published emits before storage changes.
-            Task { @MainActor in refreshTimeline() }
-        }
-        .onReceive(store.$hiddenMessageIDs) { _ in
-            Task { @MainActor in refreshTimeline() }
-        }
-        .onChange(of: hiddenThroughID) { _, _ in refreshTimeline() }
-        .onChange(of: bgVersion) { _, _ in reloadBG() }
-        .sheet(isPresented: $showingPatEditor) {
-            PatSettingsView(suffix: $patSuffix)
-                .presentationDetents([.height(330)])
-                .presentationDragIndicator(.visible)
-        }
-
-        .sheet(item: $approvalSheet) { item in
-            ApprovalSheetView(store: store, item: item)
-                .presentationDetents([.medium, .large])
-                .presentationDragIndicator(.visible)
-        }
-        .sheet(isPresented: Binding(
-            get: { reactionTargetID != nil },
-            set: { if !$0 { reactionTargetID = nil } }
-        )) {
-            ReactionPickerView(emojis: emojis) { emoji in
-                if let reactionTargetID {
-                    store.toggleReaction(emoji, for: reactionTargetID)
-                }
-                self.reactionTargetID = nil
-            }
-            .presentationDetents([.height(330)])
-            .presentationDragIndicator(.visible)
-            .presentationBackground(.ultraThickMaterial)
-        }
-    }
-
-    private var chatBackground: some View {
-        Group {
-            if let bg = bgImage {
-                GeometryReader { geo in
-                    Image(uiImage: bg)
-                        .resizable()
-                        .scaledToFill()
-                        .frame(width: geo.size.width, height: geo.size.height)
-                        .clipped()
-                }
-                .overlay(Color.black.opacity(0.025))
-                .ignoresSafeArea()
-            } else {
-                ZStack {
-                    LinearGradient(
-                        colors: [
-                            Color(red: 1.00, green: 0.90, blue: 0.95),
-                            Color(red: 0.91, green: 0.88, blue: 1.00),
-                            Color(red: 1.00, green: 0.96, blue: 0.90)
-                        ],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                    Circle()
-                        .fill(Color.pink.opacity(0.26))
-                        .frame(width: 260, height: 260)
-                        .blur(radius: 45)
-                        .offset(x: 130, y: -250)
-                    Circle()
-                        .fill(Color.purple.opacity(0.18))
-                        .frame(width: 300, height: 300)
-                        .blur(radius: 55)
-                        .offset(x: -150, y: 260)
-                }
-                .ignoresSafeArea()
-            }
-        }
-    }
-
-    private func reloadBG() {
-        bgLoadTask?.cancel()
-        guard bgVersion > 0 else {
-            bgImage = nil
-            return
-        }
-        // 背景图从磁盘读 + 解码挪出主线程：进聊天页第一帧不再被一张大图堵住，
-        // 图解好回到主线程再挂上；换背景时取消上一张的加载。
-        bgLoadTask = Task { @MainActor in
-            let image = await Task.detached(priority: .userInitiated) {
-                guard let loaded = UIImage(contentsOfFile: SettingsView.bgPath.path) else { return nil as UIImage? }
-                return loaded.preparingForDisplay()
-            }.value
-            guard !Task.isCancelled else { return }
-            bgImage = image
-        }
-    }
-
-    private func jumpWithoutAnimation(
-        _ proxy: ScrollViewProxy,
-        to id: some Hashable,
-        anchor: UnitPoint
-    ) {
-        var transaction = Transaction()
-        transaction.disablesAnimations = true
-        withTransaction(transaction) {
-            proxy.scrollTo(id, anchor: anchor)
-        }
     }
 
     private func followPanel(_ proxy: ScrollViewProxy) {
@@ -10540,12 +10545,12 @@ struct ChatView: View {
                         onReply: {},
                         onReact: { _ in },
                         onMoreReactions: {},
-                        onRetract: { _ in },
-                        onDelete: { _ in },
+                        onRetract: {},
+                        onDelete: {},
                         onLongPress: {},
                         onJumpToReply: { _ in },
                         onAvatarDoubleTap: {},
-                        onExpansionChange: { _, _ in },
+                        onExpansionChange: { _ in },
                         canRetract: false
                     )
                 } else {
@@ -10557,8 +10562,8 @@ struct ChatView: View {
                         onReply: {},
                         onReact: { _ in },
                         onMoreReactions: {},
-                        onRetract: { _ in },
-                        onDelete: { _ in },
+                        onRetract: {},
+                        onDelete: {},
                         onLongPress: {},
                         onJumpToReply: { _ in },
                         onAvatarDoubleTap: {},
