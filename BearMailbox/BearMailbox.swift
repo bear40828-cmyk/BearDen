@@ -9936,8 +9936,9 @@ struct ChatView: View {
             if store.hasLoadedInitialMessages || !store.msgs.isEmpty {
                 ScrollViewReader { proxy in
                 ZStack(alignment: .bottom) {
-                    ScrollView {
-                        ChatTimeline(
+                    // List 直接撑满：之前外层还套着 ScrollView，List 在竖向
+                    // ScrollView 里高度会被压成 0，聊天页一片空白。
+                    ChatTimeline(
                             store: store,
                             messages: timelineMessages,
                             reactions: store.reactions,
@@ -10015,20 +10016,19 @@ struct ChatView: View {
                         .equatable()
                         .padding(.horizontal, 14)
                         .padding(.top, 8)
-                    }
-                    .chatInitialBottomAnchor()
-                    .transparentTopScrollEdge()
-                    .scrollDismissesKeyboard(.interactively)
-                    .simultaneousGesture(
-                        SpatialTapGesture(coordinateSpace: .global).onEnded { value in
-                            guard !ChatTextSelection.isSelectionInteraction(at: value.location) else { return }
+                        .chatInitialBottomAnchor()
+                        .transparentTopScrollEdge()
+                        .scrollDismissesKeyboard(.interactively)
+                        .simultaneousGesture(
+                            SpatialTapGesture(coordinateSpace: .global).onEnded { value in
+                                guard !ChatTextSelection.isSelectionInteraction(at: value.location) else { return }
+                                selectedMessageID = nil
+                                NotificationCenter.default.post(name: .clearChatTextSelection, object: nil)
+                            }
+                        )
+                        .onReceive(NotificationCenter.default.publisher(for: .clearChatTextSelection)) { _ in
                             selectedMessageID = nil
-                            NotificationCenter.default.post(name: .clearChatTextSelection, object: nil)
                         }
-                    )
-                    .onReceive(NotificationCenter.default.publisher(for: .clearChatTextSelection)) { _ in
-                        selectedMessageID = nil
-                    }
 
                     ChatComposerView(
                         draftKey: draftKey,
