@@ -6808,7 +6808,7 @@ struct ChatReplyComposerCard: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
-        .modifier(BubbleGlass(shape: RoundedRectangle(cornerRadius: 20, style: .continuous)))
+        .modifier(Glass(shape: RoundedRectangle(cornerRadius: 20, style: .continuous)))
         .transition(.move(edge: .bottom).combined(with: .opacity))
     }
 }
@@ -9174,11 +9174,18 @@ private struct ChatTimeline: View, Equatable {
     }
 
     var body: some View {
-        LazyVStack(spacing: 10) {
+        // iMessage 式列表：List 底层是 UITableView，只建看得见的行、
+        // 滚出屏幕的 cell 直接复用；新消息只在尾部插入一行，不重建整个列表。
+        List {
             if hasEarlierMessages {
                 Button("查看更早的消息", action: onLoadEarlier)
                     .font(.system(size: 13))
                     .padding(.vertical, 12)
+                    .frame(maxWidth: .infinity)
+                    .buttonStyle(.plain)
+                    .listRowInsets(EdgeInsets())
+                    .listRowSeparator(.hidden)
+                    .listRowBackground(Color.clear)
             }
             ForEach(rows) { row in
                 let message = row.message
@@ -9257,12 +9264,19 @@ private struct ChatTimeline: View, Equatable {
                     .modifier(ChatMessageHighlight(active: highlightedMessageID == message.id))
                 }
             }
+            .listRowInsets(EdgeInsets(top: 5, leading: 0, bottom: 5, trailing: 0))
+            .listRowSeparator(.hidden)
+            .listRowBackground(Color.clear)
 
             Color.clear
                 .frame(height: bottomInset)
                 .id("chat-bottom-anchor")
+                .listRowInsets(EdgeInsets())
+                .listRowSeparator(.hidden)
+                .listRowBackground(Color.clear)
         }
-        .scrollTargetLayout()
+        .listStyle(.plain)
+        .scrollContentBackground(.hidden)
     }
 }
 
@@ -9533,7 +9547,7 @@ private struct ChatComposerView: View {
             }
         }
         .padding(10)
-        .modifier(BubbleGlass(shape: RoundedRectangle(cornerRadius: 24, style: .continuous)))
+        .modifier(Glass(shape: RoundedRectangle(cornerRadius: 24, style: .continuous)))
     }
 
     private var attachmentPanel: some View {
@@ -9590,7 +9604,7 @@ private struct ChatComposerView: View {
         }
         .padding(.horizontal, 8)
         .padding(.bottom, 10)
-        .modifier(BubbleGlass(shape: RoundedRectangle(cornerRadius: 28, style: .continuous)))
+        .modifier(Glass(shape: RoundedRectangle(cornerRadius: 28, style: .continuous)))
     }
 
     private var reactionPanel: some View {
@@ -9656,7 +9670,7 @@ private struct ChatComposerView: View {
             .frame(height: 220)
         }
         .padding(12)
-        .modifier(BubbleGlass(shape: RoundedRectangle(cornerRadius: 28, style: .continuous)))
+        .modifier(Glass(shape: RoundedRectangle(cornerRadius: 28, style: .continuous)))
     }
 
     private var panelHandle: some View {
@@ -9850,7 +9864,16 @@ struct ChatView: View {
         withTransaction(transaction) {
             hasEarlierMessages = start > 0 || store.hasOlderMessages
             timelineStartID = start < eligible.count ? eligible[start].id : nil
-            timelineMessages = Array(eligible.dropFirst(start))
+            // 新消息只往尾部追加：窗口起点不变时，新窗口就是旧窗口加几条，
+            // 直接 append，List 只插入新行；窗口滑动、撤回、隐藏时
+            // 前缀对不上，再整窗替换。
+            let newWindow = Array(eligible.dropFirst(start))
+            if newWindow.count >= timelineMessages.count,
+               Array(newWindow.prefix(timelineMessages.count)) == timelineMessages {
+                timelineMessages.append(contentsOf: newWindow.dropFirst(timelineMessages.count))
+            } else {
+                timelineMessages = newWindow
+            }
         }
     }
 
@@ -10142,7 +10165,7 @@ struct ChatView: View {
                 }
                 .padding(.horizontal, 18)
                 .padding(.vertical, 7)
-                .modifier(BubbleGlass(shape: Capsule()))
+                .modifier(Glass(shape: Capsule()))
             }
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
@@ -10625,7 +10648,7 @@ private struct ChatInputRow: View {
             Image(systemName: isRecording ? "waveform" : (isTranscribing ? "mic.fill" : "waveform.circle"))
                 .font(.system(size: 24, weight: .medium))
                 .frame(width: 42, height: 44)
-                .modifier(BubbleGlass(shape: Circle()))
+                .modifier(Glass(shape: Circle()))
                 .overlay {
                     VoicePressSurface(
                         onTap: onVoiceTap,
@@ -10641,7 +10664,7 @@ private struct ChatInputRow: View {
                 .padding(.horizontal, 13)
                 .padding(.vertical, 11)
                 .frame(minWidth: 70, minHeight: 44)
-                .modifier(BubbleGlass(shape: Capsule()))
+                .modifier(Glass(shape: Capsule()))
 
             circleButton(
                 systemName: showingReactions ? "keyboard" : "face.smiling",
@@ -10671,7 +10694,7 @@ private struct ChatInputRow: View {
                 .contentShape(Circle())
             }
             .buttonStyle(.plain)
-            .modifier(BubbleGlass(shape: Circle()))
+            .modifier(Glass(shape: Circle()))
             .opacity(canSend ? 1 : 0.42)
             .disabled(!canSend || uploading)
             .accessibilityLabel("发送")
@@ -10690,7 +10713,7 @@ private struct ChatInputRow: View {
                 .contentShape(Circle())
         }
         .buttonStyle(.plain)
-        .modifier(BubbleGlass(shape: Circle()))
+        .modifier(Glass(shape: Circle()))
     }
 }
 
@@ -10726,7 +10749,7 @@ private struct PatSettingsView: View {
                         .font(.system(size: 16))
                         .padding(.horizontal, 15)
                         .frame(height: 50)
-                        .modifier(BubbleGlass(shape: RoundedRectangle(cornerRadius: 18, style: .continuous)))
+                        .modifier(Glass(shape: RoundedRectangle(cornerRadius: 18, style: .continuous)))
                     Text("预览：我拍了拍「你」 \(draft)")
                         .font(.system(size: 13, weight: .medium))
                         .foregroundStyle(.secondary)
@@ -12648,9 +12671,9 @@ struct Avatar: View {
 }
 
 
-// ===== 气泡专用：完整系统 regular glass 只放背景层；不降低玻璃层透明度，避免漏出未模糊原图 =====
-// Message-only surface: clear glass avoids regular glass thickening on tall bubbles.
-// Keep toolbar/composer BubbleGlass unchanged.
+// ===== 气泡专用：实心底（见下面的 BubbleGlass）；玻璃只留顶栏和输入栏 =====
+// Message-only surface: solid fill, no live blur. Unused at the moment;
+// kept for reference next to BubbleGlass.
 struct MessageGlass<S: InsettableShape>: ViewModifier {
     let shape: S
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
@@ -12686,31 +12709,19 @@ extension View {
     }
 }
 
+// 消息气泡用实心底：iMessage 那样不透背景、不实时模糊，
+// 满屏气泡也不用每帧重采样；玻璃只留给顶栏和输入栏（用 Glass）。
 struct BubbleGlass<S: InsettableShape>: ViewModifier {
     let shape: S
 
-    private var edge: LinearGradient {
-        LinearGradient(
-            colors: [
-                Color.white.opacity(0.72),
-                Color.white.opacity(0.14),
-                Color.white.opacity(0.42)
-            ],
-            startPoint: .topLeading,
-            endPoint: .bottomTrailing
-        )
-    }
-
     func body(content: Content) -> some View {
-        // 毛玻璃换成普通半透明：气泡和输入框的系统玻璃每帧重采样背景，
-        // 聊天页一开几十个玻璃面一起算，主线程直接被拖垮。
         content
             .background {
                 shape
-                    .fill(Color(uiColor: .systemBackground).opacity(0.72))
+                    .fill(Color(uiColor: .systemBackground))
             }
-            .overlay(shape.strokeBorder(edge, lineWidth: 0.85))
-            .shadow(color: Color.black.opacity(0.085), radius: 9, y: 3)
+            .overlay(shape.strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5))
+            .shadow(color: Color.black.opacity(0.06), radius: 9, y: 3)
     }
 }
 
