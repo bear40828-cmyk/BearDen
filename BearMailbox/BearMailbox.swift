@@ -1971,7 +1971,7 @@ struct Bubble: View {
     var onMoreReactions: () -> Void
     var onRetract: () -> Void
     var onDelete: () -> Void
-    var onLongPress: () -> Void
+    var onTap: () -> Void
     var onJumpToReply: (Int) -> Void
     var onAvatarDoubleTap: () -> Void
     var mine: Bool { msg.from == "me" }
@@ -2021,24 +2021,34 @@ struct Bubble: View {
                     .foregroundStyle(.secondary.opacity(0.78))
                     .padding(.horizontal, 4)
             }
-            // 菜单已搬到 ChatView 层（List cell 会裁掉贴在里面的菜单）；
-            // 这里只在选中时上报气泡全局 frame，供长按预览定位。
+            // 菜单在 ChatView 层（List cell 会裁掉贴在里面的菜单）；
+            // 这里上报气泡 frame：全局那份供点空白处判断点在哪个气泡上，
+            // 聊天区坐标系那份供菜单定位。
             .background {
                 GeometryReader { proxy in
                     Color.clear
-                        .onAppear { if showsActions { ChatTextSelection.messageFrames[msg.id] = proxy.frame(in: .global) } }
-                        .onChange(of: showsActions) { _, selected in
-                            if selected { ChatTextSelection.messageFrames[msg.id] = proxy.frame(in: .global) }
-                            else { ChatTextSelection.messageFrames.removeValue(forKey: msg.id) }
-                            NotificationCenter.default.post(name: .chatTextSelectionChanged, object: nil)
+                        .onAppear {
+                            ChatTextSelection.messageFrames[msg.id] = proxy.frame(in: .global)
+                            ChatTextSelection.messageFramesLocal[msg.id] = proxy.frame(in: .named("chatMainArea"))
                         }
-                        .onChange(of: proxy.frame(in: .global)) { _, frame in
-                            if showsActions {
-                                ChatTextSelection.messageFrames[msg.id] = frame
+                        .onChange(of: showsActions) { _, selected in
+                            if selected {
+                                ChatTextSelection.messageFrames[msg.id] = proxy.frame(in: .global)
+                                ChatTextSelection.messageFramesLocal[msg.id] = proxy.frame(in: .named("chatMainArea"))
                                 NotificationCenter.default.post(name: .chatTextSelectionChanged, object: nil)
                             }
                         }
-                        .onDisappear { ChatTextSelection.messageFrames.removeValue(forKey: msg.id) }
+                        .onChange(of: proxy.frame(in: .global)) { _, frame in
+                            ChatTextSelection.messageFrames[msg.id] = frame
+                            ChatTextSelection.messageFramesLocal[msg.id] = proxy.frame(in: .named("chatMainArea"))
+                            if showsActions {
+                                NotificationCenter.default.post(name: .chatTextSelectionChanged, object: nil)
+                            }
+                        }
+                        .onDisappear {
+                            ChatTextSelection.messageFrames.removeValue(forKey: msg.id)
+                            ChatTextSelection.messageFramesLocal.removeValue(forKey: msg.id)
+                        }
                 }
             }
 
@@ -2055,11 +2065,9 @@ struct Bubble: View {
     private var content: some View {
         if let location = LocationInfo.parse(msg.text) {
             LocationMessageCard(info: location)
-                .onLongPressGesture(minimumDuration: 0.34, perform: onLongPress)
         } else if let f = msg.file, API.isImage(f) {
             VStack(alignment: mine ? .trailing : .leading, spacing: 6) {
                 ChatImageView(name: f, onOpen: { onImage(API.fileURL(f)) })
-                    .onLongPressGesture(minimumDuration: 0.34, perform: onLongPress)
                 if reply != nil || !msg.displayedText.isEmpty {
                     textBubble(text: msg.displayedText, showsReply: true)
                 }
@@ -2068,13 +2076,11 @@ struct Bubble: View {
             VStack(alignment: mine ? .trailing : .leading, spacing: 6) {
                 if reply != nil { textBubble(text: msg.displayedText, showsReply: true) }
                 VoiceMessagePlayer(url: API.fileURL(f))
-                    .onLongPressGesture(minimumDuration: 0.34, perform: onLongPress)
             }
         } else if let f = msg.file, API.isVideo(f) {
             VStack(alignment: mine ? .trailing : .leading, spacing: 6) {
                 if reply != nil { textBubble(text: msg.displayedText, showsReply: true) }
                 VideoThumbnailBubble(name: f) { openingFile = true }
-                    .onLongPressGesture(minimumDuration: 0.34, perform: onLongPress)
                     .fullScreenCover(isPresented: $openingFile) {
                         VideoMessageViewer(name: f, onFavorite: { try await FavoriteStore.shared.add(message: msg, peerName: peer?.displayName) })
                     }
@@ -2090,7 +2096,6 @@ struct Bubble: View {
                         .modifier(BubbleGlass(shape: RoundedRectangle(cornerRadius: 26, style: .continuous)))
                 }
                 .buttonStyle(.plain)
-                .onLongPressGesture(minimumDuration: 0.34, perform: onLongPress)
                 .fullScreenCover(isPresented: $openingFile) {
                     FileMessageViewer(name: f, onFavorite: { try await FavoriteStore.shared.add(message: msg, peerName: peer?.displayName) })
                 }
@@ -2132,7 +2137,7 @@ struct Bubble: View {
             }
 
             if !text.isEmpty {
-                SelectableMarkdownText(text: text, onLongPress: onLongPress, selectionKey: "remote:\(msg.id)")
+                SelectableMarkdownText(text: text, onTap: onTap, selectionKey: "remote:\(msg.id)")
             }
 
             if let url = MessageURLDetector.firstWebURL(in: text) {
@@ -2345,12 +2350,14 @@ private extension Notification.Name {
 private enum ChatTextSelection {
     static weak var active: ChatSelectionTextView?
     static var menuFrames: [UUID: CGRect] = [:]
-    /// 选中气泡的全局 frame（长按预览定位用），由气泡上报。
+    /// 气泡的全局 frame：点空白处时判断点在哪个气泡上，由气泡上报。
     static var messageFrames: [Int: CGRect] = [:]
+    /// 气泡在聊天区坐标系（chatMainArea）里的 frame：菜单按它定位，由气泡上报。
+    static var messageFramesLocal: [Int: CGRect] = [:]
     /// 系统选字模式：为 true 时放开系统编辑菜单，自定义长按短路。
     static var systemSelecting = false
-    /// 长按落点（气泡内坐标），“选择”时用来取词。
-    static var longPressPoint: CGPoint?
+    /// 点按落点（气泡内坐标），“选择”时用来取词。
+    static var tapPoint: CGPoint?
     static func isSelectionInteraction(at point: CGPoint) -> Bool {
         if menuFrames.values.contains(where: { $0.contains(point) }) { return true }
         guard let active, active.selectedRange.length > 0 else { return false }
@@ -2427,10 +2434,10 @@ private final class ChatSelectionTextView: UITextView {
     }
 }
 
-// 直接在气泡内拖动选区；同一次长按也会唤起自定义操作栏。
+// 直接在气泡内拖动选区；点一下文字唤起操作栏。
 private struct SelectableMarkdownText: UIViewRepresentable {
     let text: String
-    let onLongPress: () -> Void
+    let onTap: () -> Void
     var selectionKey: String = ""
 
     final class Coordinator: NSObject, UIGestureRecognizerDelegate, UITextViewDelegate {
@@ -2458,12 +2465,11 @@ private struct SelectableMarkdownText: UIViewRepresentable {
             textView.resignFirstResponder()
         }
 
-        @objc func held(_ recognizer: UILongPressGestureRecognizer) {
-            guard recognizer.state == .began else { return }
-            // 系统选字模式下不再弹自定义预览，拖动手柄选字不受打扰。
+        @objc func tapped(_ recognizer: UITapGestureRecognizer) {
+            // 系统选字模式下点文字不再弹菜单，拖动手柄选字不受打扰。
             guard !ChatTextSelection.systemSelecting else { return }
             if let view = textView {
-                ChatTextSelection.longPressPoint = recognizer.location(in: view)
+                ChatTextSelection.tapPoint = recognizer.location(in: view)
             }
             if let view = textView as? ChatSelectionTextView {
                 if let old = ChatTextSelection.active, old !== view {
@@ -2472,7 +2478,7 @@ private struct SelectableMarkdownText: UIViewRepresentable {
                 }
                 ChatTextSelection.active = view
             }
-            parent.onLongPress()
+            parent.onTap()
         }
 
         func textViewDidChangeSelection(_ textView: UITextView) {
@@ -2508,11 +2514,10 @@ private struct SelectableMarkdownText: UIViewRepresentable {
         v.adjustsFontForContentSizeCategory = true
         v.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         v.attributedText = uiMarkdown(text, size: 16)
-        let hold = UILongPressGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.held(_:)))
-        hold.minimumPressDuration = 0.34
-        hold.cancelsTouchesInView = false
-        hold.delegate = context.coordinator
-        v.addGestureRecognizer(hold)
+        let tap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.tapped(_:)))
+        tap.cancelsTouchesInView = false
+        tap.delegate = context.coordinator
+        v.addGestureRecognizer(tap)
         context.coordinator.textView = v
         return v
     }
@@ -3619,7 +3624,7 @@ private struct LocalAIMessageBubble: View, Equatable {
                     }
                 }.buttonStyle(.plain)
             }
-            SelectableMarkdownText(text: message.text, onLongPress: { showsActions = true }, selectionKey: "local:\(message.id)")
+            SelectableMarkdownText(text: message.text, onTap: { showsActions = true }, selectionKey: "local:\(message.id)")
             if let url = MessageURLDetector.firstWebURL(in: message.text) {
                 MessageLinkPreviewCard(url: url)
             }
@@ -8858,7 +8863,7 @@ private struct MediaAlbumBubble: View {
     let onMoreReactions: () -> Void
     let onRetract: () -> Void
     let onDelete: () -> Void
-    let onLongPress: () -> Void
+    let onTap: () -> Void
     let onJumpToReply: (Int) -> Void
     let onAvatarDoubleTap: () -> Void
     let onExpansionChange: (Bool) -> Void
@@ -8924,7 +8929,7 @@ private struct MediaAlbumBubble: View {
                             .buttonStyle(.plain)
                         }
                         if !displayedCaption.isEmpty {
-                            SelectableMarkdownText(text: displayedCaption, onLongPress: onLongPress, selectionKey: "album:\(messages.first?.id ?? 0)")
+                            SelectableMarkdownText(text: displayedCaption, onTap: onTap, selectionKey: "album:\(messages.first?.id ?? 0)")
                         }
                     }
                     .padding(.horizontal, 14)
@@ -8952,24 +8957,32 @@ private struct MediaAlbumBubble: View {
                 }
             }
             .contentShape(Rectangle())
-            .onLongPressGesture(minimumDuration: 0.34, perform: onLongPress)
-            // 菜单已搬到 ChatView 层；这里只上报气泡全局 frame，供长按预览定位。
+            // 菜单在 ChatView 层；这里上报气泡 frame（全局 + 聊天区坐标系两份）。
             .background {
                 GeometryReader { proxy in
                     Color.clear
-                        .onAppear { if showsActions { ChatTextSelection.messageFrames[messages.first?.id ?? 0] = proxy.frame(in: .global) } }
-                        .onChange(of: showsActions) { _, selected in
-                            if selected { ChatTextSelection.messageFrames[messages.first?.id ?? 0] = proxy.frame(in: .global) }
-                            else { ChatTextSelection.messageFrames.removeValue(forKey: messages.first?.id ?? 0) }
-                            NotificationCenter.default.post(name: .chatTextSelectionChanged, object: nil)
+                        .onAppear {
+                            ChatTextSelection.messageFrames[messages.first?.id ?? 0] = proxy.frame(in: .global)
+                            ChatTextSelection.messageFramesLocal[messages.first?.id ?? 0] = proxy.frame(in: .named("chatMainArea"))
                         }
-                        .onChange(of: proxy.frame(in: .global)) { _, frame in
-                            if showsActions {
-                                ChatTextSelection.messageFrames[messages.first?.id ?? 0] = frame
+                        .onChange(of: showsActions) { _, selected in
+                            if selected {
+                                ChatTextSelection.messageFrames[messages.first?.id ?? 0] = proxy.frame(in: .global)
+                                ChatTextSelection.messageFramesLocal[messages.first?.id ?? 0] = proxy.frame(in: .named("chatMainArea"))
                                 NotificationCenter.default.post(name: .chatTextSelectionChanged, object: nil)
                             }
                         }
-                        .onDisappear { ChatTextSelection.messageFrames.removeValue(forKey: messages.first?.id ?? 0) }
+                        .onChange(of: proxy.frame(in: .global)) { _, frame in
+                            ChatTextSelection.messageFrames[messages.first?.id ?? 0] = frame
+                            ChatTextSelection.messageFramesLocal[messages.first?.id ?? 0] = proxy.frame(in: .named("chatMainArea"))
+                            if showsActions {
+                                NotificationCenter.default.post(name: .chatTextSelectionChanged, object: nil)
+                            }
+                        }
+                        .onDisappear {
+                            ChatTextSelection.messageFrames.removeValue(forKey: messages.first?.id ?? 0)
+                            ChatTextSelection.messageFramesLocal.removeValue(forKey: messages.first?.id ?? 0)
+                        }
                 }
             }
 
@@ -9299,7 +9312,7 @@ private struct ChatTimeline: View, Equatable {
                             onMoreReactions: { onMoreReactions(message.id) },
                             onRetract: { onRetract(message) },
                             onDelete: { onDelete(message) },
-                            onLongPress: { onSelectActions(message.id) },
+                            onTap: { onSelectActions(message.id) },
                             onJumpToReply: onJumpToReply,
                             onAvatarDoubleTap: onAvatarDoubleTap,
                             onExpansionChange: { onAlbumExpansion(message.id, $0) },
@@ -9319,7 +9332,7 @@ private struct ChatTimeline: View, Equatable {
                         onMoreReactions: { onMoreReactions(message.id) },
                         onRetract: { onRetract(message) },
                         onDelete: { onDelete(message) },
-                        onLongPress: { onSelectActions(message.id) },
+                        onTap: { onSelectActions(message.id) },
                         onJumpToReply: onJumpToReply,
                         onAvatarDoubleTap: onAvatarDoubleTap,
                         partText: row.text,
@@ -9873,9 +9886,9 @@ struct ChatView: View {
     @State private var bgLoadTask: Task<Void, Never>?
     @State private var hasMeasuredComposer = false
     @State private var initialScrollReady = false
-    /// 长按预览/选字进行中：为 true 时禁止 List 自动滚到底。
+    /// 菜单/选字进行中：为 true 时禁止 List 自动滚到底。
     @State private var isSelectingText = false
-    /// 系统选字模式：自定义长按短路，系统手柄 + 系统菜单接管。
+    /// 系统选字模式：点按菜单短路，系统手柄 + 系统菜单接管。
     @State private var isSystemSelecting = false
     /// 选区变化时强制重算菜单位置的计数。
     @State private var selectionNonce = 0
@@ -10252,7 +10265,7 @@ struct ChatView: View {
                                 inputFocused = true
                             },
                             onSelectActions: { messageID in
-                                // 系统选字模式下长按不再弹自定义预览。
+                                // 系统选字模式下点按不再弹菜单。
                                 guard !isSystemSelecting else { return }
                                 withAnimation(.spring(response: 0.22, dampingFraction: 0.86)) {
                                     let next = selectedMessageID == messageID ? nil : messageID
@@ -10304,6 +10317,8 @@ struct ChatView: View {
                         .simultaneousGesture(
                             SpatialTapGesture(coordinateSpace: .global).onEnded { value in
                                 guard !ChatTextSelection.isSelectionInteraction(at: value.location) else { return }
+                                // 点在气泡上时交给气泡自己的点按处理（开/关菜单），这里不抢着关。
+                                if ChatTextSelection.messageFrames.values.contains(where: { $0.contains(value.location) }) { return }
                                 selectedMessageID = nil
                                 isSelectingText = false
                                 if isSystemSelecting {
@@ -10318,13 +10333,13 @@ struct ChatView: View {
                             selectedMessageID = nil
                         }
                         .onReceive(NotificationCenter.default.publisher(for: .chatTextSelectionChanged)) { _ in
-                            // 选区/气泡 frame 变化时重算菜单位置（菜单按实时窗口坐标定位）。
+                            // 选区/气泡 frame 变化时重算菜单位置（菜单按聊天区坐标系里的 frame 定位）。
                             if selectedMessageID != nil { selectionNonce += 1 }
                         }
 
                     if let selectedID = selectedMessageID,
                        let selectedMsg = timelineMessages.first(where: { $0.id == selectedID }) {
-                        longPressPreview(msg: selectedMsg, frame: ChatTextSelection.messageFrames[selectedID] ?? .zero, geo: geo)
+                        messageMenu(msg: selectedMsg, frame: ChatTextSelection.messageFramesLocal[selectedID] ?? .zero, geo: geo)
                     }
 
                     ChatComposerView(
@@ -10364,6 +10379,7 @@ struct ChatView: View {
                         onStagePhotos: { items in stagePhotos(items) }
                     )
                 }
+                .coordinateSpace(name: "chatMainArea")
                 .task {
                     guard !initialScrollReady else { return }
                     // 只定位一次：等 Lazy 行、缓存图和输入框几次布局都落定
@@ -10447,7 +10463,7 @@ struct ChatView: View {
     }
 
     private func followPanel(_ proxy: ScrollViewProxy) {
-        // 长按预览/系统选字时不自动滚到底，否则菜单和文字会跑开。
+        // 菜单/系统选字时不自动滚到底，否则菜单和文字会跑开。
         guard !isSelectingText && !isSystemSelecting else { return }
         panelScrollTask?.cancel()
         panelScrollTask = Task { @MainActor in
@@ -10465,7 +10481,7 @@ struct ChatView: View {
     }
 
 
-    private func closeLongPressPreview() {
+    private func closeMessageMenu() {
         selectedMessageID = nil
         isSelectingText = false
     }
@@ -10476,20 +10492,14 @@ struct ChatView: View {
         return Date().timeIntervalSince1970 - raw < 120
     }
 
-    private func albumMessagesForPreview(_ msg: Msg) -> [Msg] {
-        guard let id = MediaGroupInfo.parse(msg.text)?.id else { return [msg] }
-        return timelineMessages.filter { MediaGroupInfo.parse($0.text)?.id == id }
-            .sorted { (MediaGroupInfo.parse($0.text)?.index ?? 0) < (MediaGroupInfo.parse($1.text)?.index ?? 0) }
-    }
-
-    /// “选择”：撤掉自定义 chrome，进系统选字（系统手柄 + 系统菜单）。
+    /// “选择”：撤掉菜单，进系统选字（系统手柄 + 系统菜单）。
     private func enterSystemSelection() {
         selectedMessageID = nil
         isSelectingText = false
         isSystemSelecting = true
         ChatTextSelection.systemSelecting = true
         guard let view = ChatTextSelection.active else { return }
-        if let point = ChatTextSelection.longPressPoint,
+        if let point = ChatTextSelection.tapPoint,
            let pos = view.closestPosition(to: point),
            let range = view.tokenizer.rangeEnclosingPosition(pos, with: .word, inDirection: .storage(.forward)) {
             view.selectedTextRange = range
@@ -10499,25 +10509,20 @@ struct ChatView: View {
         view.becomeFirstResponder()
     }
 
-    /// iMessage 式长按预览：背景变暗模糊，消息浮起放大，上方表情条，下方菜单。
+    /// 点按菜单：气泡不动，不变暗、不浮起、不带表情条，只在气泡附近弹出选择框。
     @ViewBuilder
-    private func longPressPreview(msg: Msg, frame: CGRect, geo: GeometryProxy) -> some View {
+    private func messageMenu(msg: Msg, frame: CGRect, geo: GeometryProxy) -> some View {
         let mine = msg.from == "me"
         let isAlbum = MediaGroupInfo.parse(msg.text) != nil
         let selectionKey = isAlbum ? "album:\(msg.id)" : "remote:\(msg.id)"
         let copyText = isAlbum ? MediaGroupInfo.batchCaption(msg.text) : msg.displayedText
-        // 菜单锚点：有局部选区时用选区矩形，否则用气泡 frame。
-        let anchor = ChatTextSelection.partialSelectionRect(key: selectionKey) ?? frame
         let topInset = geo.safeAreaInsets.top
         let visibleBottom = geo.size.height - composerHeight - 8
         let menuH = menuHeight
-        let barH: CGFloat = 44
-        // 表情条：贴在气泡上方，夹在可见区内。
-        let barY = max(anchor.minY - 30, topInset + barH / 2 + 4)
-        let barX = min(max(frame.midX, 125), geo.size.width - 125)
-        // 菜单：优先放气泡下方，放不下放表情条上方。
-        let belowY = anchor.maxY + 12 + menuH / 2
-        let aboveY = barY - barH / 2 - 12 - menuH / 2
+        // 菜单优先放气泡下方，放不下放气泡上方；x 按己方/对方对齐并夹在屏幕内。
+        // frame 是聊天区坐标系里的，overlay 也在同一坐标系，不用再换算。
+        let belowY = frame.maxY + 8 + menuH / 2
+        let aboveY = frame.minY - 8 - menuH / 2
         let menuY = belowY + menuH / 2 <= visibleBottom
             ? belowY
             : max(aboveY, topInset + menuH / 2 + 8)
@@ -10526,104 +10531,40 @@ struct ChatView: View {
             : min(max(frame.minX + 129, 137), geo.size.width - 137)
         let showSelect = !copyText.isEmpty && ChatTextSelection.active?.selectionKey == selectionKey
         ZStack {
-            // 变暗 + 模糊背景，点按关闭；拖动也被吞掉，预览时列表不滚动。
-            Rectangle().fill(.ultraThinMaterial)
-            Color.black.opacity(0.28)
+            // 透明点按层：点菜单以外的地方关菜单，不遮挡、不变暗。
+            Color.clear
+                .contentShape(Rectangle())
                 .onTapGesture {
-                    closeLongPressPreview()
+                    closeMessageMenu()
                     NotificationCenter.default.post(name: .clearChatTextSelection, object: nil)
                 }
-                .gesture(DragGesture().onChanged { _ in })
-            // 悬浮放大的消息副本（不响应手势）。
-            Group {
-                if isAlbum {
-                    MediaAlbumBubble(
-                        messages: albumMessagesForPreview(msg),
-                        reactions: store.reactions[msg.id] ?? [],
-                        showsActions: false,
-                        onImage: { viewer = ViewerItem(url: $0) },
-                        onReply: {},
-                        onReact: { _ in },
-                        onMoreReactions: {},
-                        onRetract: {},
-                        onDelete: {},
-                        onLongPress: {},
-                        onJumpToReply: { _ in },
-                        onAvatarDoubleTap: {},
-                        onExpansionChange: { _ in },
-                        canRetract: false
-                    )
-                } else {
-                    Bubble(
-                        msg: msg,
-                        reactions: store.reactions[msg.id] ?? [],
-                        showsActions: false,
-                        onImage: { viewer = ViewerItem(url: $0) },
-                        onReply: {},
-                        onReact: { _ in },
-                        onMoreReactions: {},
-                        onRetract: {},
-                        onDelete: {},
-                        onLongPress: {},
-                        onJumpToReply: { _ in },
-                        onAvatarDoubleTap: {},
-                        partText: nil,
-                        showsReplyPreview: true,
-                        visiblePartCount: Int.max,
-                        activity: store.activities[msg.id],
-                        canRetract: false
-                    )
-                }
-            }
-            .position(x: frame.midX, y: frame.midY)
-            .scaleEffect(1.04)
-            .allowsHitTesting(false)
-            .transition(.scale(scale: 0.96).combined(with: .opacity))
-            // 表情快捷条。
-            HStack(spacing: 6) {
-                ForEach(["❤️", "👍", "👎", "😂", "‼️", "❓"], id: \.self) { emoji in
-                    Button {
-                        store.toggleReaction(emoji, for: msg.id)
-                        closeLongPressPreview()
-                    } label: {
-                        Text(emoji).font(.system(size: 26))
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            .background(.ultraThinMaterial, in: Capsule())
-            .position(x: barX, y: barY)
-            .transition(.scale(scale: 0.9).combined(with: .opacity))
-            // 菜单。
             MessageActionBar(
                 onReply: {
                     replyingTo = msg
-                    closeLongPressPreview()
+                    closeMessageMenu()
                     showingAttachments = false
                     showingReactions = false
                     inputFocused = true
                 },
                 onReact: { emoji in
                     store.toggleReaction(emoji, for: msg.id)
-                    closeLongPressPreview()
+                    closeMessageMenu()
                 },
                 onMore: {
                     reactionTargetID = msg.id
-                    closeLongPressPreview()
+                    closeMessageMenu()
                 },
                 onSelectText: showSelect ? { enterSystemSelection() } : nil,
-                onDismiss: { closeLongPressPreview() },
+                onDismiss: { closeMessageMenu() },
                 externalPositioning: true,
                 onHeightChange: { menuHeight = $0 },
                 onRetract: {
                     retractMessage(msg)
-                    closeLongPressPreview()
+                    closeMessageMenu()
                 },
                 onDelete: {
                     store.hideLocally(msg)
-                    closeLongPressPreview()
+                    closeMessageMenu()
                 },
                 copyText: copyText,
                 mine: canRetractMessage(msg),
