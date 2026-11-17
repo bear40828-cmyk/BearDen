@@ -761,7 +761,9 @@ final class ChatStore: ObservableObject {
         }
         started = true
         Task { await poll() }
-        let timer = Timer(timeInterval: 2, repeats: true) { [weak self] _ in
+        // 聊天页开着时轮询放宽到 5 秒：2 秒一轮时，附属状态的写回会反复触发
+        // 整个聊天页重绘，打字时页面跟着一跳一跳。
+        let timer = Timer(timeInterval: 5, repeats: true) { [weak self] _ in
             Task { await self?.poll() }
         }
         RunLoop.main.add(timer, forMode: .common)
@@ -778,7 +780,7 @@ final class ChatStore: ObservableObject {
         }
     }
 
-    /// 引用计数归零时才真正停轮询：清掉 2 秒 Timer、取消在途请求、摘掉前后台监听。
+    /// 引用计数归零时才真正停轮询：清掉 5 秒 Timer、取消在途请求、摘掉前后台监听。
     /// 聊天页和对话列表的 onDisappear 各调一次，切页时先后的顺序不会误停。
     func stop() {
         pollRetainCount = max(0, pollRetainCount - 1)
@@ -829,7 +831,6 @@ final class ChatStore: ObservableObject {
     func poll() async {
         guard localPeer == nil else { return }
         guard let base else { return }
-        Task { await refreshPeerTyping(); await refreshForwarded() }
         guard !isPolling else { pollAgain = true; return }
         let generation = pollGeneration
         isPolling = true
@@ -865,20 +866,24 @@ final class ChatStore: ObservableObject {
         let isInitialLoad = !hasLoadedInitialMessages
         if isInitialLoad { hasLoadedInitialMessages = true }
         let fresh = list.filter { $0.id > last }
-        if !fresh.isEmpty {
-            last = max(last, fresh.map(\.id).max() ?? last)
-            // 首次只留最近一页进内存，剩下的历史往上翻时再按页取；
-            // 新消息本来就只有几条，原样处理。
-            let page = isInitialLoad ? Array(fresh.suffix(Self.messagePageSize)) : fresh
-            if isInitialLoad { hasOlderMessages = fresh.count >= Self.messagePageSize }
-            if isInitialLoad || UIApplication.shared.applicationState != .active {
-                // 历史记录首次载入时一次显示，不能把旧消息重新演一遍。
-                appendDisplayed(page)
-            } else {
-                // 自己刚发出的消息立即显示；对方同一轮产生的多个气泡进入展示队列。
-                appendDisplayed(page.filter { $0.from == "me" })
-                enqueuePeerMessages(page.filter { $0.from != "me" })
-            }
+        // 没有新消息的空轮询什么状态都不改：不拉 typing/forwarded，不补
+        // reactions/activities，不写任何 @Published。这样打字时页面不会
+        // 每 5 秒被重绘一次；附属状态（对方正在输入、表情、动态）下次
+        // 真有新消息时再一起补。
+        guard !fresh.isEmpty else { return }
+        Task { await refreshPeerTyping(); await refreshForwarded() }
+        last = max(last, fresh.map(\.id).max() ?? last)
+        // 首次只留最近一页进内存，剩下的历史往上翻时再按页取；
+        // 新消息本来就只有几条，原样处理。
+        let page = isInitialLoad ? Array(fresh.suffix(Self.messagePageSize)) : fresh
+        if isInitialLoad { hasOlderMessages = fresh.count >= Self.messagePageSize }
+        if isInitialLoad || UIApplication.shared.applicationState != .active {
+            // 历史记录首次载入时一次显示，不能把旧消息重新演一遍。
+            appendDisplayed(page)
+        } else {
+            // 自己刚发出的消息立即显示；对方同一轮产生的多个气泡进入展示队列。
+            appendDisplayed(page.filter { $0.from == "me" })
+            enqueuePeerMessages(page.filter { $0.from != "me" })
         }
         // 表情反应失败或变慢不能再挡住聊天记录；消息先显示，再补反应。
         Task { await pullReactions() }
