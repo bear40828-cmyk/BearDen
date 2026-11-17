@@ -2,7 +2,7 @@
 # - 静态托管 public/
 # - PUT /_upload/<路径>?t=<上传口令>        只能写 public/
 # - POST /api/send      {"text": "..."}      用户发消息，头里带 X-Pass
-# - GET  /api/messages?since=<id>            拉取消息（她的和回复），头里带 X-Pass
+# - GET  /api/messages?since=<id>&limit=<n>&before=<id>  拉取消息（她的和回复），头里带 X-Pass；limit 只取最后 n 条，before 只取该 id 之前的
 # - POST /api/reply     {"text": "...", "file"?: "<data/files 里的文件名>"}   只接受本机，用来回复用户
 # - POST /api/upload    原始文件体，头 X-Pass、X-Filename   存进 data/files/，返回 {"name"}
 # - GET/POST /api/profile                   备注和头像：{"contacts": {id: {"name","avatar"}}, "me": {"avatar"}}
@@ -332,8 +332,26 @@ class H(http.server.SimpleHTTPRequestHandler):
         if u.path == "/api/messages":
             if not (s._authed() or s._local()):
                 return s._json(401, {"error": "pass"})
-            since = int(urllib.parse.parse_qs(u.query).get("since", ["0"])[0] or 0)
-            return s._json(200, [m for m in load() if m["id"] > since])
+            qs = urllib.parse.parse_qs(u.query)
+            since = int(qs.get("since", ["0"])[0] or 0)
+            items = [m for m in load() if m["id"] > since]
+            # ?before=<id>：只取该 id 之前的消息（往上翻加载更早的一页）。
+            before = qs.get("before", [None])[0]
+            if before is not None:
+                try:
+                    items = [m for m in items if m["id"] < int(before)]
+                except ValueError:
+                    pass
+            # ?limit=<n>：只取最后 n 条（首次只拉最近一页）。
+            limit = qs.get("limit", [None])[0]
+            if limit is not None:
+                try:
+                    n = int(limit)
+                except ValueError:
+                    n = 0
+                if n > 0:
+                    items = items[-n:]
+            return s._json(200, items)
         if u.path == "/api/reactions":
             return s._json(200, load_reactions())
         if u.path == "/api/forwarded":
