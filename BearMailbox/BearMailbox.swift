@@ -12563,16 +12563,9 @@ struct MessageGlass<S: InsettableShape>: ViewModifier {
                 if reduceTransparency {
                     shape.fill(Color(uiColor: .systemBackground))
                 } else {
-#if compiler(>=6.2)
-                    if #available(iOS 26.0, *) {
-                        shape.fill(Color.clear)
-                            .glassEffect(.clear.tint(Color(uiColor: .systemBackground).opacity(0.28)), in: shape)
-                    } else {
-                        shape.fill(.ultraThinMaterial)
-                    }
-#else
-                    shape.fill(.ultraThinMaterial)
-#endif
+                    // 毛玻璃换成普通半透明：系统玻璃每帧都要重采样背景，
+                    // 长消息一多就拖慢主线程；纯色半透明不用实时模糊。
+                    shape.fill(Color(uiColor: .systemBackground).opacity(0.72))
                 }
             }
             .overlay(shape.strokeBorder(.white.opacity(0.55), lineWidth: 0.85))
@@ -12611,34 +12604,15 @@ struct BubbleGlass<S: InsettableShape>: ViewModifier {
     }
 
     func body(content: Content) -> some View {
-#if compiler(>=6.2)
-        if #available(iOS 26.0, *) {
-            content
-                .background {
-                    shape
-                        .fill(Color.clear)
-                        .glassEffect(.regular, in: shape)
-                }
-                .overlay(shape.strokeBorder(edge, lineWidth: 0.85))
-                .shadow(color: Color.black.opacity(0.085), radius: 9, y: 3)
-        } else {
-            content
-                .background {
-                    shape
-                        .fill(.regularMaterial)
-                }
-                .overlay(shape.strokeBorder(edge, lineWidth: 0.85))
-                .shadow(color: Color.black.opacity(0.08), radius: 9, y: 3)
-        }
-#else
+        // 毛玻璃换成普通半透明：气泡和输入框的系统玻璃每帧重采样背景，
+        // 聊天页一开几十个玻璃面一起算，主线程直接被拖垮。
         content
             .background {
                 shape
-                    .fill(.regularMaterial)
+                    .fill(Color(uiColor: .systemBackground).opacity(0.72))
             }
             .overlay(shape.strokeBorder(edge, lineWidth: 0.85))
-            .shadow(color: Color.black.opacity(0.08), radius: 9, y: 3)
-#endif
+            .shadow(color: Color.black.opacity(0.085), radius: 9, y: 3)
     }
 }
 
