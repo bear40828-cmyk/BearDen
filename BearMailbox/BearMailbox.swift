@@ -1,6 +1,6 @@
 // 熊窝 · SwiftUI（iOS 26 Liquid Glass，单文件）
-// 接口（不改服务器）：
-//   GET  /api/messages?since=<上一条id>   拉消息 [{id, from, text, ts, file?}]，from 是 me / claude
+// 接口：
+//   GET  /api/messages?since=<上一条id>&limit=<n>&before=<id>   拉消息 [{id, from, text, ts, file?}]，from 是 me / claude；limit 只取最后 n 条，before 只取该 id 之前的
 //   POST /api/send                        body {"text": "...", "file": "..."}
 //   GET  /api/file/<file>                 取文件/图片
 //   POST /api/upload                      body 是文件原始数据，头 X-Filename
@@ -684,6 +684,11 @@ final class ChatStore: ObservableObject {
     private var approvalParseMisses: Set<Int> = []
     private var base: URL? { API.base }
     private var last = 0
+    /// 一页拉几条历史。首次只拉最近 50 条，往上翻再按页取。
+    static let messagePageSize = 50
+    /// 已加载窗口之外是否还有更早的消息（按每次返回的条数判断）。
+    @Published private(set) var hasOlderMessages = false
+    private var loadingOlder = false
     private var timer: Timer?
     private var started = false
     /// 打开的聊天/列表页数量；只有都离开了才停轮询，切页时先后的顺序不会误停。
@@ -840,7 +845,12 @@ final class ChatStore: ObservableObject {
         }
         let since = last
         var c = URLComponents(url: base.appendingPathComponent("api/messages"), resolvingAgainstBaseURL: false)!
-        c.queryItems = [URLQueryItem(name: "since", value: String(since))]
+        var queryItems = [URLQueryItem(name: "since", value: String(since))]
+        if !hasLoadedInitialMessages {
+            // 首次只拉最近一页；老服务器会忽略 limit，客户端再取后 50 条。
+            queryItems.append(URLQueryItem(name: "limit", value: String(Self.messagePageSize)))
+        }
+        c.queryItems = queryItems
         var request = URLRequest(url: c.url!, cachePolicy: .reloadIgnoringLocalCacheData)
         request.timeoutInterval = 10
         let requestTask = Task { try await URLSession.shared.data(for: request) }
@@ -857,18 +867,53 @@ final class ChatStore: ObservableObject {
         let fresh = list.filter { $0.id > last }
         if !fresh.isEmpty {
             last = max(last, fresh.map(\.id).max() ?? last)
+            // 首次只留最近一页进内存，剩下的历史往上翻时再按页取；
+            // 新消息本来就只有几条，原样处理。
+            let page = isInitialLoad ? Array(fresh.suffix(Self.messagePageSize)) : fresh
+            if isInitialLoad { hasOlderMessages = fresh.count >= Self.messagePageSize }
             if isInitialLoad || UIApplication.shared.applicationState != .active {
                 // 历史记录首次载入时一次显示，不能把旧消息重新演一遍。
-                appendDisplayed(fresh)
+                appendDisplayed(page)
             } else {
                 // 自己刚发出的消息立即显示；对方同一轮产生的多个气泡进入展示队列。
-                appendDisplayed(fresh.filter { $0.from == "me" })
-                enqueuePeerMessages(fresh.filter { $0.from != "me" })
+                appendDisplayed(page.filter { $0.from == "me" })
+                enqueuePeerMessages(page.filter { $0.from != "me" })
             }
         }
         // 表情反应失败或变慢不能再挡住聊天记录；消息先显示，再补反应。
         Task { await pullReactions() }
         Task { await pullActivities() }
+    }
+
+    /// 往上翻加载更早的一页：取已加载窗口之前 50 条，插到队首。返回实际取到的条数。
+    /// 老服务器会忽略 before/limit、把全部历史都返回，这时只取窗口之前的最后 50 条。
+    func loadOlderMessages() async -> Int {
+        guard localPeer == nil, let base, let oldest = msgs.first?.id, !loadingOlder else { return 0 }
+        loadingOlder = true
+        defer { loadingOlder = false }
+        var c = URLComponents(url: base.appendingPathComponent("api/messages"), resolvingAgainstBaseURL: false)!
+        c.queryItems = [
+            URLQueryItem(name: "before", value: String(oldest)),
+            URLQueryItem(name: "limit", value: String(Self.messagePageSize)),
+        ]
+        var request = URLRequest(url: c.url!, cachePolicy: .reloadIgnoringLocalCacheData)
+        request.timeoutInterval = 10
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { return 0 }
+        let decoded = await Task.detached(priority: .userInitiated) {
+            try? JSONDecoder().decode([Msg].self, from: data)
+        }.value
+        guard let list = decoded else { return 0 }
+        let older = Array(list.filter { $0.id < oldest }
+            .sorted { $0.ts != $1.ts ? $0.ts < $1.ts : $0.id < $1.id }
+            .suffix(Self.messagePageSize))
+        guard !older.isEmpty else {
+            hasOlderMessages = false
+            return 0
+        }
+        msgs.insert(contentsOf: older, at: 0)
+        hasOlderMessages = older.count >= Self.messagePageSize
+        return older.count
     }
 
     private func pullActivities() async {
@@ -9306,7 +9351,7 @@ struct ChatView: View {
     @State private var hasMeasuredComposer = false
     @State private var initialScrollReady = false
     @State private var timelineMessages: [Msg] = []
-    @State private var timelineLimit = 100
+    @State private var timelineLimit = ChatStore.messagePageSize
     @State private var timelineStartID: Int?
     @State private var hasEarlierMessages = false
     @State private var composerHeight: CGFloat = 57
@@ -9375,7 +9420,7 @@ struct ChatView: View {
         var transaction = Transaction(animation: nil)
         transaction.disablesAnimations = true
         withTransaction(transaction) {
-            hasEarlierMessages = start > 0
+            hasEarlierMessages = start > 0 || store.hasOlderMessages
             timelineStartID = start < eligible.count ? eligible[start].id : nil
             timelineMessages = Array(eligible.dropFirst(start))
         }
@@ -9451,11 +9496,18 @@ struct ChatView: View {
                             hasEarlierMessages: hasEarlierMessages,
                             onLoadEarlier: {
                                 let anchor = timelineMessages.first?.id
-                                timelineLimit = timelineMessages.count + 100
-                                timelineStartID = nil
-                                refreshTimeline()
-                                if let anchor {
-                                    Task { @MainActor in
+                                Task { @MainActor in
+                                    if store.hasOlderMessages {
+                                        // 窗口之外还有更早的历史，先去服务器取一页。
+                                        let fetched = await store.loadOlderMessages()
+                                        if fetched > 0 { timelineLimit += fetched }
+                                    } else {
+                                        // 已经全在内存里了，只多显示一页。
+                                        timelineLimit = timelineMessages.count + ChatStore.messagePageSize
+                                    }
+                                    timelineStartID = nil
+                                    refreshTimeline()
+                                    if let anchor {
                                         await Task.yield()
                                         jumpWithoutAnimation(proxy, to: anchor, anchor: .top)
                                     }
@@ -9542,9 +9594,9 @@ struct ChatView: View {
                 .onPreferenceChange(ComposerHeightPreferenceKey.self) { height in
                     guard height > 0, abs(height - composerHeight) > 0.5 else { return }
                     composerHeight = height
-                    if hasMeasuredComposer {
-                        followPanel(proxy)
-                    } else {
+                    // 输入框换行只改底边距，不贴底滚动：贴底由 sizeChanges 锚点自己处理，
+                    // 再 scrollTo 会把正在往上翻的人一把拽到底，打字时页面一跳。
+                    if !hasMeasuredComposer {
                         hasMeasuredComposer = true
                         if initialScrollReady { followPanel(proxy) }
                     }
