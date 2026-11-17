@@ -686,6 +686,8 @@ final class ChatStore: ObservableObject {
     private var last = 0
     private var timer: Timer?
     private var started = false
+    /// 打开的聊天/列表页数量；只有都离开了才停轮询，切页时先后的顺序不会误停。
+    private var pollRetainCount = 0
     private var isPolling = false
     private var pollAgain = false
     private var foregroundObserver: NSObjectProtocol?
@@ -737,6 +739,7 @@ final class ChatStore: ObservableObject {
     }
 
     func start() {
+        pollRetainCount += 1
         if localPeer != nil {
             guard !started else { return }
             started = true
@@ -768,6 +771,29 @@ final class ChatStore: ObservableObject {
         ) { [weak self] _ in
             Task { @MainActor in self?.finishPendingReveals() }
         }
+    }
+
+    /// 引用计数归零时才真正停轮询：清掉 2 秒 Timer、取消在途请求、摘掉前后台监听。
+    /// 聊天页和对话列表的 onDisappear 各调一次，切页时先后的顺序不会误停。
+    func stop() {
+        pollRetainCount = max(0, pollRetainCount - 1)
+        guard pollRetainCount == 0 else { return }
+        timer?.invalidate()
+        timer = nil
+        pollGeneration = UUID()
+        pollRequestTask?.cancel()
+        pollRequestTask = nil
+        isPolling = false
+        pollAgain = false
+        if let observer = foregroundObserver {
+            NotificationCenter.default.removeObserver(observer)
+            foregroundObserver = nil
+        }
+        if let observer = backgroundObserver {
+            NotificationCenter.default.removeObserver(observer)
+            backgroundObserver = nil
+        }
+        started = false
     }
 
     private func finishPendingReveals() {
@@ -1013,19 +1039,26 @@ final class ChatStore: ObservableObject {
     // 已交给助手的自己的消息 id，用来决定是否还能撤回
     @Published private(set) var forwardedMessageIDs: Set<Int> = []
     private func refreshForwarded() async {
-        let cutoff = Date().timeIntervalSince1970 - 180
-        let recent = msgs.filter { m in
-            let raw = m.ts > 10_000_000_000 ? Double(m.ts) / 1000 : Double(m.ts)
-            return m.from == "me" && raw > cutoff && !forwardedMessageIDs.contains(m.id)
-        }
-        guard let first = recent.map(\.id).min() else { return }
+        // 全量过滤、请求和解 JSON 都在后台做，主线程只写回结果，
+        // 避免每轮 poll 都在主线程扫一遍整个消息历史、卡住输入。
+        let snapshot = msgs
+        let known = forwardedMessageIDs
         guard let base else { return }
-        var c = URLComponents(url: base.appendingPathComponent("api/forwarded"), resolvingAgainstBaseURL: false)!
-        c.queryItems = [URLQueryItem(name: "since", value: String(first - 1))]
-        var request = URLRequest(url: c.url!, cachePolicy: .reloadIgnoringLocalCacheData)
-        request.timeoutInterval = 5
-        guard let (data, _) = try? await URLSession.shared.data(for: request),
-              let ids = try? JSONDecoder().decode([Int].self, from: data) else { return }
+        let ids = await Task.detached(priority: .utility) { () -> [Int]? in
+            let cutoff = Date().timeIntervalSince1970 - 180
+            let recent = snapshot.filter { m in
+                let raw = m.ts > 10_000_000_000 ? Double(m.ts) / 1000 : Double(m.ts)
+                return m.from == "me" && raw > cutoff && !known.contains(m.id)
+            }
+            guard let first = recent.map(\.id).min() else { return nil }
+            var c = URLComponents(url: base.appendingPathComponent("api/forwarded"), resolvingAgainstBaseURL: false)!
+            c.queryItems = [URLQueryItem(name: "since", value: String(first - 1))]
+            var request = URLRequest(url: c.url!, cachePolicy: .reloadIgnoringLocalCacheData)
+            request.timeoutInterval = 5
+            guard let (data, _) = try? await URLSession.shared.data(for: request) else { return nil }
+            return try? JSONDecoder().decode([Int].self, from: data)
+        }.value
+        guard let ids else { return }
         let next = forwardedMessageIDs.union(ids)
         if next != forwardedMessageIDs { forwardedMessageIDs = next }
     }
@@ -4929,6 +4962,9 @@ struct ConversationListView: View {
             loadWorkspaceItems()
             syncRootTabBarVisibility()
             reconcileInbox()
+        }
+        .onDisappear {
+            store.stop()
         }
         .onReceive(NotificationCenter.default.publisher(for: .localAIMessageAppended)) { _ in
             reconcileInbox()
@@ -9665,6 +9701,7 @@ struct ChatView: View {
             markLocalPeerActive(true)
         }
         .onDisappear {
+            store.stop()
             voice.stopTranscription()
             panelScrollTask?.cancel()
             highlightTask?.cancel()
