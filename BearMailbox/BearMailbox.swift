@@ -1971,7 +1971,8 @@ struct Bubble: View {
     var onMoreReactions: () -> Void
     var onRetract: () -> Void
     var onDelete: () -> Void
-    var onTap: () -> Void
+    /// Long press; passes the bubble's global frame captured at press time.
+    var onLongPress: (CGRect) -> Void
     var onJumpToReply: (Int) -> Void
     var onAvatarDoubleTap: () -> Void
     var mine: Bool { msg.from == "me" }
@@ -1986,7 +1987,10 @@ struct Bubble: View {
     var activity: ChatActivity? = nil
     var canRetract = false
     @State var openingFile = false
+    @State private var frameBox = BubbleFrameBox()
     @Environment(\.chatPeerConversation) private var peer
+
+    private func press() { onLongPress(frameBox.frame) }
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
@@ -2021,36 +2025,7 @@ struct Bubble: View {
                     .foregroundStyle(.secondary.opacity(0.78))
                     .padding(.horizontal, 4)
             }
-            // 菜单在 ChatView 层（List cell 会裁掉贴在里面的菜单）；
-            // 这里上报气泡 frame：全局那份供点空白处判断点在哪个气泡上，
-            // 聊天区坐标系那份供菜单定位。
-            .background {
-                GeometryReader { proxy in
-                    Color.clear
-                        .onAppear {
-                            ChatTextSelection.messageFrames[msg.id] = proxy.frame(in: .global)
-                            ChatTextSelection.messageFramesLocal[msg.id] = proxy.frame(in: .named("chatMainArea"))
-                        }
-                        .onChange(of: showsActions) { _, selected in
-                            if selected {
-                                ChatTextSelection.messageFrames[msg.id] = proxy.frame(in: .global)
-                                ChatTextSelection.messageFramesLocal[msg.id] = proxy.frame(in: .named("chatMainArea"))
-                                NotificationCenter.default.post(name: .chatTextSelectionChanged, object: nil)
-                            }
-                        }
-                        .onChange(of: proxy.frame(in: .global)) { _, frame in
-                            ChatTextSelection.messageFrames[msg.id] = frame
-                            ChatTextSelection.messageFramesLocal[msg.id] = proxy.frame(in: .named("chatMainArea"))
-                            if showsActions {
-                                NotificationCenter.default.post(name: .chatTextSelectionChanged, object: nil)
-                            }
-                        }
-                        .onDisappear {
-                            ChatTextSelection.messageFrames.removeValue(forKey: msg.id)
-                            ChatTextSelection.messageFramesLocal.removeValue(forKey: msg.id)
-                        }
-                }
-            }
+            .modifier(BubbleFrameReporter(messageID: msg.id, box: frameBox, showsActions: showsActions))
 
             if mine {
                 Avatar(isMe: true)
@@ -2065,9 +2040,11 @@ struct Bubble: View {
     private var content: some View {
         if let location = LocationInfo.parse(msg.text) {
             LocationMessageCard(info: location)
+                .onLongPressGesture(minimumDuration: 0.34, perform: press)
         } else if let f = msg.file, API.isImage(f) {
             VStack(alignment: mine ? .trailing : .leading, spacing: 6) {
                 ChatImageView(name: f, onOpen: { onImage(API.fileURL(f)) })
+                    .onLongPressGesture(minimumDuration: 0.34, perform: press)
                 if reply != nil || !msg.displayedText.isEmpty {
                     textBubble(text: msg.displayedText, showsReply: true)
                 }
@@ -2076,11 +2053,13 @@ struct Bubble: View {
             VStack(alignment: mine ? .trailing : .leading, spacing: 6) {
                 if reply != nil { textBubble(text: msg.displayedText, showsReply: true) }
                 VoiceMessagePlayer(url: API.fileURL(f))
+                    .onLongPressGesture(minimumDuration: 0.34, perform: press)
             }
         } else if let f = msg.file, API.isVideo(f) {
             VStack(alignment: mine ? .trailing : .leading, spacing: 6) {
                 if reply != nil { textBubble(text: msg.displayedText, showsReply: true) }
                 VideoThumbnailBubble(name: f) { openingFile = true }
+                    .onLongPressGesture(minimumDuration: 0.34, perform: press)
                     .fullScreenCover(isPresented: $openingFile) {
                         VideoMessageViewer(name: f, onFavorite: { try await FavoriteStore.shared.add(message: msg, peerName: peer?.displayName) })
                     }
@@ -2096,6 +2075,7 @@ struct Bubble: View {
                         .modifier(BubbleGlass(shape: RoundedRectangle(cornerRadius: 26, style: .continuous)))
                 }
                 .buttonStyle(.plain)
+                .onLongPressGesture(minimumDuration: 0.34, perform: press)
                 .fullScreenCover(isPresented: $openingFile) {
                     FileMessageViewer(name: f, onFavorite: { try await FavoriteStore.shared.add(message: msg, peerName: peer?.displayName) })
                 }
@@ -2137,7 +2117,7 @@ struct Bubble: View {
             }
 
             if !text.isEmpty {
-                SelectableMarkdownText(text: text, onTap: onTap, selectionKey: "remote:\(msg.id)")
+                SelectableMarkdownText(text: text, onLongPress: press, selectionKey: "remote:\(msg.id)")
             }
 
             if let url = MessageURLDetector.firstWebURL(in: text) {
@@ -2146,7 +2126,7 @@ struct Bubble: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
-        .modifier(BubbleGlass(shape: RoundedRectangle(cornerRadius: 24, style: .continuous)))
+        .modifier(ChatTextBubbleBackground(mine: mine))
     }
 }
 
@@ -2352,8 +2332,6 @@ private enum ChatTextSelection {
     static var menuFrames: [UUID: CGRect] = [:]
     /// 气泡的全局 frame：点空白处时判断点在哪个气泡上，由气泡上报。
     static var messageFrames: [Int: CGRect] = [:]
-    /// 气泡在聊天区坐标系（chatMainArea）里的 frame：菜单按它定位，由气泡上报。
-    static var messageFramesLocal: [Int: CGRect] = [:]
     /// 系统选字模式：为 true 时放开系统编辑菜单，自定义长按短路。
     static var systemSelecting = false
     /// 点按落点（气泡内坐标），“选择”时用来取词。
@@ -2437,7 +2415,7 @@ private final class ChatSelectionTextView: UITextView {
 // 直接在气泡内拖动选区；点一下文字唤起操作栏。
 private struct SelectableMarkdownText: UIViewRepresentable {
     let text: String
-    let onTap: () -> Void
+    let onLongPress: () -> Void
     var selectionKey: String = ""
 
     final class Coordinator: NSObject, UIGestureRecognizerDelegate, UITextViewDelegate {
@@ -2465,8 +2443,9 @@ private struct SelectableMarkdownText: UIViewRepresentable {
             textView.resignFirstResponder()
         }
 
-        @objc func tapped(_ recognizer: UITapGestureRecognizer) {
-            // 系统选字模式下点文字不再弹菜单，拖动手柄选字不受打扰。
+        @objc func held(_ recognizer: UILongPressGestureRecognizer) {
+            guard recognizer.state == .began else { return }
+            // 系统选字模式下长按交给系统，不再弹自定义菜单。
             guard !ChatTextSelection.systemSelecting else { return }
             if let view = textView {
                 ChatTextSelection.tapPoint = recognizer.location(in: view)
@@ -2478,7 +2457,7 @@ private struct SelectableMarkdownText: UIViewRepresentable {
                 }
                 ChatTextSelection.active = view
             }
-            parent.onTap()
+            parent.onLongPress()
         }
 
         func textViewDidChangeSelection(_ textView: UITextView) {
@@ -2514,10 +2493,11 @@ private struct SelectableMarkdownText: UIViewRepresentable {
         v.adjustsFontForContentSizeCategory = true
         v.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         v.attributedText = uiMarkdown(text, size: 16)
-        let tap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.tapped(_:)))
-        tap.cancelsTouchesInView = false
-        tap.delegate = context.coordinator
-        v.addGestureRecognizer(tap)
+        let hold = UILongPressGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.held(_:)))
+        hold.minimumPressDuration = 0.34
+        hold.cancelsTouchesInView = false
+        hold.delegate = context.coordinator
+        v.addGestureRecognizer(hold)
         context.coordinator.textView = v
         return v
     }
@@ -3624,7 +3604,7 @@ private struct LocalAIMessageBubble: View, Equatable {
                     }
                 }.buttonStyle(.plain)
             }
-            SelectableMarkdownText(text: message.text, onTap: { showsActions = true }, selectionKey: "local:\(message.id)")
+            SelectableMarkdownText(text: message.text, onLongPress: { showsActions = true }, selectionKey: "local:\(message.id)")
             if let url = MessageURLDetector.firstWebURL(in: message.text) {
                 MessageLinkPreviewCard(url: url)
             }
@@ -8863,13 +8843,17 @@ private struct MediaAlbumBubble: View {
     let onMoreReactions: () -> Void
     let onRetract: () -> Void
     let onDelete: () -> Void
-    let onTap: () -> Void
+    /// Long press; passes the album's global frame captured at press time.
+    let onLongPress: (CGRect) -> Void
     let onJumpToReply: (Int) -> Void
     let onAvatarDoubleTap: () -> Void
     let onExpansionChange: (Bool) -> Void
     var canRetract = false
     @State private var selectedIndex = 0
     @State private var expanded = false
+    @State private var frameBox = BubbleFrameBox()
+
+    private func press() { onLongPress(frameBox.frame) }
     @Environment(\.chatPeerConversation) private var peer
 
     private var mine: Bool { messages.first?.from == "me" }
@@ -8929,12 +8913,12 @@ private struct MediaAlbumBubble: View {
                             .buttonStyle(.plain)
                         }
                         if !displayedCaption.isEmpty {
-                            SelectableMarkdownText(text: displayedCaption, onTap: onTap, selectionKey: "album:\(messages.first?.id ?? 0)")
+                            SelectableMarkdownText(text: displayedCaption, onLongPress: press, selectionKey: "album:\(messages.first?.id ?? 0)")
                         }
                     }
                     .padding(.horizontal, 14)
                     .padding(.vertical, 9)
-                    .modifier(BubbleGlass(shape: RoundedRectangle(cornerRadius: 24, style: .continuous)))
+                    .modifier(ChatTextBubbleBackground(mine: mine))
                 }
 
                 if !reactions.isEmpty {
@@ -8957,34 +8941,8 @@ private struct MediaAlbumBubble: View {
                 }
             }
             .contentShape(Rectangle())
-            // 菜单在 ChatView 层；这里上报气泡 frame（全局 + 聊天区坐标系两份）。
-            .background {
-                GeometryReader { proxy in
-                    Color.clear
-                        .onAppear {
-                            ChatTextSelection.messageFrames[messages.first?.id ?? 0] = proxy.frame(in: .global)
-                            ChatTextSelection.messageFramesLocal[messages.first?.id ?? 0] = proxy.frame(in: .named("chatMainArea"))
-                        }
-                        .onChange(of: showsActions) { _, selected in
-                            if selected {
-                                ChatTextSelection.messageFrames[messages.first?.id ?? 0] = proxy.frame(in: .global)
-                                ChatTextSelection.messageFramesLocal[messages.first?.id ?? 0] = proxy.frame(in: .named("chatMainArea"))
-                                NotificationCenter.default.post(name: .chatTextSelectionChanged, object: nil)
-                            }
-                        }
-                        .onChange(of: proxy.frame(in: .global)) { _, frame in
-                            ChatTextSelection.messageFrames[messages.first?.id ?? 0] = frame
-                            ChatTextSelection.messageFramesLocal[messages.first?.id ?? 0] = proxy.frame(in: .named("chatMainArea"))
-                            if showsActions {
-                                NotificationCenter.default.post(name: .chatTextSelectionChanged, object: nil)
-                            }
-                        }
-                        .onDisappear {
-                            ChatTextSelection.messageFrames.removeValue(forKey: messages.first?.id ?? 0)
-                            ChatTextSelection.messageFramesLocal.removeValue(forKey: messages.first?.id ?? 0)
-                        }
-                }
-            }
+            .onLongPressGesture(minimumDuration: 0.34, perform: press)
+            .modifier(BubbleFrameReporter(messageID: messages.first?.id ?? 0, box: frameBox, showsActions: showsActions))
 
             if mine { Avatar(isMe: true) } else { Spacer(minLength: 0) }
         }
@@ -9098,34 +9056,6 @@ struct PatSystemRow: View {
     }
 }
 
-/// iMessage 式“对方正在输入”：三个跳动的点，放在 List 最后一行。
-private struct ChatTypingIndicatorRow: View {
-    @State private var animate = false
-
-    var body: some View {
-        HStack(alignment: .top, spacing: 8) {
-            Avatar(isMe: false)
-            HStack(spacing: 5) {
-                ForEach(0..<3, id: \.self) { i in
-                    Circle()
-                        .fill(Color.secondary)
-                        .frame(width: 7, height: 7)
-                        .scaleEffect(animate ? 1.3 : 0.8)
-                        .opacity(animate ? 1 : 0.4)
-                        .animation(
-                            .easeInOut(duration: 0.55).repeatForever(autoreverses: true).delay(Double(i) * 0.18),
-                            value: animate
-                        )
-                }
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 11)
-            .modifier(BubbleGlass(shape: RoundedRectangle(cornerRadius: 24, style: .continuous)))
-            Spacer(minLength: 48)
-        }
-        .onAppear { animate = true }
-    }
-}
 
 private struct ChatTimeline: View, Equatable {
     private struct Row: Identifiable {
@@ -9165,7 +9095,6 @@ private struct ChatTimeline: View, Equatable {
     let answered: Set<Int>
     let revealedPartCounts: [Int: Int]
     let activities: [Int: ChatActivity]
-    let isPeerTyping: Bool
     let hasEarlierMessages: Bool
     let onLoadEarlier: () -> Void
     let selectedMessageID: Int?
@@ -9173,7 +9102,7 @@ private struct ChatTimeline: View, Equatable {
     let unreadStartMessageID: Int?
     let onImage: (URL) -> Void
     let onReply: (Msg) -> Void
-    let onSelectActions: (Int) -> Void
+    let onSelectActions: (Int, CGRect) -> Void
     let onReact: (Int, String) -> Void
     let onMoreReactions: (Int) -> Void
     let onRetract: (Msg) -> Void
@@ -9204,7 +9133,6 @@ private struct ChatTimeline: View, Equatable {
         lhs.answered == rhs.answered &&
         lhs.revealedPartCounts == rhs.revealedPartCounts &&
         lhs.activities == rhs.activities &&
-        lhs.isPeerTyping == rhs.isPeerTyping &&
         lhs.hasEarlierMessages == rhs.hasEarlierMessages &&
         lhs.selectedMessageID == rhs.selectedMessageID &&
         lhs.highlightedMessageID == rhs.highlightedMessageID &&
@@ -9312,7 +9240,7 @@ private struct ChatTimeline: View, Equatable {
                             onMoreReactions: { onMoreReactions(message.id) },
                             onRetract: { onRetract(message) },
                             onDelete: { onDelete(message) },
-                            onTap: { onSelectActions(message.id) },
+                            onLongPress: { frame in onSelectActions(message.id, frame) },
                             onJumpToReply: onJumpToReply,
                             onAvatarDoubleTap: onAvatarDoubleTap,
                             onExpansionChange: { onAlbumExpansion(message.id, $0) },
@@ -9332,7 +9260,7 @@ private struct ChatTimeline: View, Equatable {
                         onMoreReactions: { onMoreReactions(message.id) },
                         onRetract: { onRetract(message) },
                         onDelete: { onDelete(message) },
-                        onTap: { onSelectActions(message.id) },
+                        onLongPress: { frame in onSelectActions(message.id, frame) },
                         onJumpToReply: onJumpToReply,
                         onAvatarDoubleTap: onAvatarDoubleTap,
                         partText: row.text,
@@ -9348,14 +9276,6 @@ private struct ChatTimeline: View, Equatable {
             .listRowInsets(EdgeInsets(top: 5, leading: 0, bottom: 5, trailing: 0))
             .listRowSeparator(.hidden)
             .listRowBackground(Color.clear)
-
-            if isPeerTyping {
-                ChatTypingIndicatorRow()
-                    .id("chat-typing-indicator")
-                    .listRowInsets(EdgeInsets(top: 5, leading: 0, bottom: 5, trailing: 0))
-                    .listRowSeparator(.hidden)
-                    .listRowBackground(Color.clear)
-            }
 
             Color.clear
                 .frame(height: bottomInset)
@@ -9876,6 +9796,10 @@ struct ChatView: View {
     @State private var highlightedMessageID: Int?
     @State private var highlightTask: Task<Void, Never>?
     @State private var selectedMessageID: Int?
+    /// Global frame of the long-pressed bubble, captured at press time.
+    @State private var menuAnchorFrame: CGRect = .zero
+    /// Global origin of the chat area; converts bubble frames into overlay coordinates.
+    @State private var chatAreaOrigin: CGPoint = .zero
     @State private var reactionTargetID: Int?
     @State private var replyingTo: Msg?
     @State private var reEditText: String?
@@ -10232,7 +10156,6 @@ struct ChatView: View {
                             answered: store.answered,
                             revealedPartCounts: store.revealedPartCounts,
                             activities: store.activities,
-                            isPeerTyping: store.isPeerTyping,
                             hasEarlierMessages: hasEarlierMessages,
                             onLoadEarlier: {
                                 let anchor = timelineMessages.first?.id
@@ -10264,9 +10187,10 @@ struct ChatView: View {
                                 showingReactions = false
                                 inputFocused = true
                             },
-                            onSelectActions: { messageID in
-                                // 系统选字模式下点按不再弹菜单。
+                            onSelectActions: { messageID, frame in
+                                // 系统选字模式下长按交给系统，不再弹菜单。
                                 guard !isSystemSelecting else { return }
+                                menuAnchorFrame = frame
                                 withAnimation(.spring(response: 0.22, dampingFraction: 0.86)) {
                                     let next = selectedMessageID == messageID ? nil : messageID
                                     selectedMessageID = next
@@ -10339,7 +10263,14 @@ struct ChatView: View {
 
                     if let selectedID = selectedMessageID,
                        let selectedMsg = timelineMessages.first(where: { $0.id == selectedID }) {
-                        messageMenu(msg: selectedMsg, frame: ChatTextSelection.messageFramesLocal[selectedID] ?? .zero, geo: geo)
+                        // Frame reported by the selected message's own bubble (keyed by id),
+                        // falling back to the frame captured at press time.
+                        let global = ChatTextSelection.messageFrames[selectedID] ?? menuAnchorFrame
+                        messageMenu(
+                            msg: selectedMsg,
+                            frame: global.offsetBy(dx: -chatAreaOrigin.x, dy: -chatAreaOrigin.y),
+                            geo: geo
+                        )
                     }
 
                     ChatComposerView(
@@ -10379,7 +10310,9 @@ struct ChatView: View {
                         onStagePhotos: { items in stagePhotos(items) }
                     )
                 }
-                .coordinateSpace(name: "chatMainArea")
+                .onGeometryChange(for: CGPoint.self, of: { $0.frame(in: .global).origin }) { origin in
+                    chatAreaOrigin = origin
+                }
                 .task {
                     guard !initialScrollReady else { return }
                     // 只定位一次：等 Lazy 行、缓存图和输入框几次布局都落定
@@ -10402,10 +10335,6 @@ struct ChatView: View {
                        !store.isAnswered(message) {
                         approvalSheet = ApprovalSheetItem(msg: message, payload: payload)
                     }
-                }
-                .onChange(of: store.isPeerTyping) { _, _ in
-                    // “对方正在输入”出现/消失时滚到底。
-                    followPanel(proxy)
                 }
                 .onChange(of: hiddenThroughID) { _, _ in
                     jumpWithoutAnimation(proxy, to: bottomAnchor, anchor: .bottom)
@@ -10519,13 +10448,14 @@ struct ChatView: View {
         let topInset = geo.safeAreaInsets.top
         let visibleBottom = geo.size.height - composerHeight - 8
         let menuH = menuHeight
-        // 菜单优先放气泡下方，放不下放气泡上方；x 按己方/对方对齐并夹在屏幕内。
-        // frame 是聊天区坐标系里的，overlay 也在同一坐标系，不用再换算。
+        // Menu sits above the pressed bubble; falls back to below it when the
+        // top bar would cover it. Clamped so it never lands under the nav bar.
+        let topLimit = topInset + 52
         let belowY = frame.maxY + 8 + menuH / 2
         let aboveY = frame.minY - 8 - menuH / 2
-        let menuY = belowY + menuH / 2 <= visibleBottom
-            ? belowY
-            : max(aboveY, topInset + menuH / 2 + 8)
+        let menuY = aboveY - menuH / 2 >= topLimit
+            ? aboveY
+            : min(max(belowY, topLimit + menuH / 2), visibleBottom - menuH / 2)
         let menuX = mine
             ? min(max(frame.maxX - 129, 137), geo.size.width - 137)
             : min(max(frame.minX + 129, 137), geo.size.width - 137)
@@ -12374,6 +12304,7 @@ private struct AddSkillView: View {
 struct SettingsView: View {
     @AppStorage("homeBgVersion") private var homeBgVersion = 0
     @AppStorage("appearanceMode") private var appearanceMode = "light"
+    @AppStorage(ChatBubbleStyle.storageKey) private var bubbleStyle = ChatBubbleStyle.glass.rawValue
     @AppStorage("myNickname") private var myNickname = "我"
     @AppStorage("assistantRemark") private var assistantRemark = "助手"
     @AppStorage("serverBaseURL") private var serverBaseURL = ""
@@ -12635,6 +12566,18 @@ struct SettingsView: View {
                 Text("跟随系统").tag("system")
                 Text("浅色").tag("light")
                 Text("深色").tag("dark")
+            }
+            .pickerStyle(.segmented)
+
+            Divider().opacity(0.24)
+
+            Text("气泡样式")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.secondary)
+            Picker("气泡样式", selection: $bubbleStyle) {
+                ForEach(ChatBubbleStyle.allCases, id: \.rawValue) { style in
+                    Text(style.title).tag(style.rawValue)
+                }
             }
             .pickerStyle(.segmented)
         }
@@ -12958,6 +12901,128 @@ struct BubbleGlass<S: InsettableShape>: ViewModifier {
             }
             .overlay(shape.strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5))
             .shadow(color: Color.black.opacity(0.06), radius: 9, y: 3)
+    }
+}
+
+/// Per-bubble frame holder; a reference type so geometry updates do not re-render the bubble.
+final class BubbleFrameBox {
+    var frame: CGRect = .zero
+}
+
+/// Tracks a bubble's global frame into its own box and the id-keyed lookup table.
+private struct BubbleFrameReporter: ViewModifier {
+    let messageID: Int
+    let box: BubbleFrameBox
+    let showsActions: Bool
+
+    func body(content: Content) -> some View {
+        content
+            .onGeometryChange(for: CGRect.self, of: { $0.frame(in: .global) }) { frame in
+                box.frame = frame
+                ChatTextSelection.messageFrames[messageID] = frame
+                if showsActions {
+                    NotificationCenter.default.post(name: .chatTextSelectionChanged, object: nil)
+                }
+            }
+            .onDisappear {
+                if ChatTextSelection.messageFrames[messageID] == box.frame {
+                    ChatTextSelection.messageFrames.removeValue(forKey: messageID)
+                }
+            }
+    }
+}
+
+enum ChatBubbleStyle: String, CaseIterable {
+    case glass, droplet, clay, none
+    static let storageKey = "chatBubbleStyle"
+    var title: String {
+        switch self {
+        case .glass: return "玻璃"
+        case .droplet: return "水珠"
+        case .clay: return "黏土"
+        case .none: return "无气泡"
+        }
+    }
+}
+
+/// Text bubble background. All variants are flat fills, gradients and shadows only
+/// (no materials or live blur) so they stay cheap in a scrolling list.
+struct ChatTextBubbleBackground: ViewModifier {
+    let mine: Bool
+    @AppStorage(ChatBubbleStyle.storageKey) private var styleRaw = ChatBubbleStyle.glass.rawValue
+
+    private var style: ChatBubbleStyle { ChatBubbleStyle(rawValue: styleRaw) ?? .glass }
+    private var shape: RoundedRectangle { RoundedRectangle(cornerRadius: 22, style: .continuous) }
+
+    func body(content: Content) -> some View {
+        switch style {
+        case .glass:
+            content
+                .environment(\.colorScheme, .light)
+                .background { shape.fill(Color.white.opacity(0.6)) }
+                .overlay {
+                    shape.strokeBorder(
+                        LinearGradient(colors: [Color.white.opacity(0.95), Color.white.opacity(0)],
+                                       startPoint: .top, endPoint: .bottom),
+                        lineWidth: 1
+                    )
+                }
+                .compositingGroup()
+                .shadow(color: Color.black.opacity(0.05), radius: 8, y: 2)
+        case .droplet:
+            let capsule = RoundedRectangle(cornerRadius: 26, style: .continuous)
+            content
+                .environment(\.colorScheme, .light)
+                .background {
+                    capsule.fill(LinearGradient(
+                        colors: mine
+                            ? [Color(red: 1.0, green: 0.93, blue: 0.95), Color(red: 0.99, green: 0.85, blue: 0.89)]
+                            : [Color(red: 0.97, green: 0.99, blue: 1.0), Color(red: 0.86, green: 0.93, blue: 0.99)],
+                        startPoint: .top, endPoint: .bottom
+                    ))
+                }
+                .overlay(alignment: .top) {
+                    // Thin highlight along the top inner edge.
+                    capsule
+                        .inset(by: 1.5)
+                        .stroke(
+                            LinearGradient(colors: [Color.white.opacity(0.9), Color.white.opacity(0)],
+                                           startPoint: .top, endPoint: .center),
+                            lineWidth: 1.5
+                        )
+                }
+                .compositingGroup()
+                .shadow(color: (mine ? Color(red: 0.85, green: 0.55, blue: 0.65) : Color(red: 0.5, green: 0.65, blue: 0.85)).opacity(0.22),
+                        radius: 10, y: 5)
+        case .clay:
+            let fill = mine ? Color(red: 0.97, green: 0.78, blue: 0.85) : Color(red: 0.84, green: 0.87, blue: 0.97)
+            let deep = mine ? Color(red: 0.86, green: 0.58, blue: 0.69) : Color(red: 0.64, green: 0.69, blue: 0.86)
+            content
+                .environment(\.colorScheme, .light)
+                .background {
+                    ZStack {
+                        shape.fill(fill)
+                        // Darker same-hue strip along the bottom edge (faux inner shadow).
+                        shape.fill(LinearGradient(
+                            stops: [.init(color: deep.opacity(0), location: 0.62),
+                                    .init(color: deep.opacity(0.55), location: 1)],
+                            startPoint: .top, endPoint: .bottom
+                        ))
+                        // Subtle top highlight.
+                        shape.fill(LinearGradient(
+                            stops: [.init(color: Color.white.opacity(0.45), location: 0),
+                                    .init(color: Color.white.opacity(0), location: 0.3)],
+                            startPoint: .top, endPoint: .bottom
+                        ))
+                    }
+                    .clipShape(shape)
+                }
+                .compositingGroup()
+                .shadow(color: deep.opacity(0.28), radius: 7, y: 4)
+        case .none:
+            content
+                .shadow(color: Color.black.opacity(0.35), radius: 1.5, y: 0.5)
+        }
     }
 }
 
