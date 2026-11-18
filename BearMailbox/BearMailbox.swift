@@ -1994,17 +1994,15 @@ struct Bubble: View {
     @State private var frameBox = BubbleFrameBox()
     @Environment(\.chatPeerConversation) private var peer
 
-    private func press() { onLongPress(frameBox.frame) }
+    private func press() { onLongPress(frameBox.liveFrame) }
 
     /// Menu trigger from a double tap; prefers the tracked bubble frame when it
     /// covers the tapped spot, otherwise the rect reported at gesture time.
     private func activate(_ rect: CGRect) {
-        let box = frameBox.frame
-        if !box.isEmpty, box.insetBy(dx: -4, dy: -4).contains(CGPoint(x: rect.midX, y: rect.midY)) {
-            onLongPress(box)
-        } else {
-            onLongPress(rect.insetBy(dx: -14, dy: -9))
-        }
+        // Always anchor to the bubble's own frame; the tap point is only a last resort
+        // when the bubble has not been laid out yet.
+        let box = frameBox.liveFrame
+        onLongPress(box.isEmpty ? rect.insetBy(dx: -14, dy: -9) : box)
     }
 
     var body: some View {
@@ -2317,8 +2315,7 @@ private func swiftMarkdown(_ source: String) -> AttributedString {
     return (try? AttributedString(markdown: source, options: options)) ?? AttributedString(source)
 }
 
-private func uiMarkdown(_ source: String, size: CGFloat) -> NSAttributedString {
-    let choice = ChatFontChoice.current
+private func uiMarkdown(_ source: String, size: CGFloat, font choice: ChatFontChoice = ChatFontChoice.current) -> NSAttributedString {
     let regular = choice.uiFont(size: size)
     let result = NSMutableAttributedString(
         string: source,
@@ -2454,7 +2451,12 @@ private struct SelectableMarkdownText: UIViewRepresentable {
     let onActivate: (CGRect) -> Void
     var selectionKey: String = ""
 
-    private var renderKey: String { ChatFontChoice.current.rawValue + "|" + text }
+    /// Observed directly so a font change re-renders every visible bubble at once,
+    /// including rows a parent equality check would otherwise skip.
+    @AppStorage(ChatFontChoice.storageKey) private var fontChoiceRaw = ChatFontChoice.system.rawValue
+    private var fontChoice: ChatFontChoice { ChatFontChoice(rawValue: fontChoiceRaw) ?? .system }
+
+    private var renderKey: String { fontChoice.rawValue + "|" + text }
 
     final class Coordinator: NSObject, UIGestureRecognizerDelegate, UITextViewDelegate {
         var parent: SelectableMarkdownText
@@ -2541,7 +2543,7 @@ private struct SelectableMarkdownText: UIViewRepresentable {
         v.textContainer.lineFragmentPadding = 0
         v.adjustsFontForContentSizeCategory = true
         v.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        v.attributedText = uiMarkdown(text, size: 16)
+        v.attributedText = uiMarkdown(text, size: 16, font: fontChoice)
         let doubleTap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.doubleTapped(_:)))
         doubleTap.numberOfTapsRequired = 2
         doubleTap.cancelsTouchesInView = false
@@ -2558,7 +2560,8 @@ private struct SelectableMarkdownText: UIViewRepresentable {
         (v as? ChatSelectionTextView)?.selectionKey = selectionKey
         if context.coordinator.renderedSource != renderKey {
             context.coordinator.renderedSource = renderKey
-            v.attributedText = uiMarkdown(text, size: 16)
+            v.attributedText = uiMarkdown(text, size: 16, font: fontChoice)
+            v.invalidateIntrinsicContentSize()
         }
     }
 
@@ -4401,7 +4404,14 @@ private struct ScrollEdgePullTracker: ViewModifier {
     let onRelease: (CGFloat) -> Void
 
     /// Plain reference storage: scroll samples must not invalidate any view.
-    private final class Track { var eligible = false; var interacting = false; var overscroll: CGFloat = 0 }
+    private final class Track {
+        var eligible = false
+        var interacting = false
+        var overscroll: CGFloat = 0
+        /// Edge overscroll sampled while no finger was down and the content was settled.
+        var restOverscroll: CGFloat = 0
+        var settled = true
+    }
     @State private var track = Track()
 
     @available(iOS 18.0, *)
@@ -4427,17 +4437,25 @@ private struct ScrollEdgePullTracker: ViewModifier {
                         // into the edge never qualifies.
                         if !track.interacting {
                             track.interacting = true
-                            track.eligible = enabled && old == .idle && abs(edgeOverscroll(context.geometry)) <= 1.5
+                            // The geometry in `context` may already include the first few points
+                            // of the drag, so the resting position recorded before the touch is
+                            // what decides eligibility.
+                            track.eligible = enabled && old == .idle && track.settled && abs(track.restOverscroll) <= 2
                             track.overscroll = 0
                         }
-                    } else if track.interacting {
-                        track.interacting = false
-                        if track.eligible { onRelease(track.overscroll) }
-                        track.eligible = false
+                    } else {
+                        if track.interacting {
+                            track.interacting = false
+                            if track.eligible { onRelease(track.overscroll) }
+                            track.eligible = false
+                        }
+                        track.settled = new == .idle
                     }
                 }
-                // Clamped so ordinary scrolling (negative overscroll) produces no callbacks.
-                .onScrollGeometryChange(for: CGFloat.self, of: { max(edgeOverscroll($0), 0) }) { _, value in
+                .onScrollGeometryChange(for: CGFloat.self, of: { edgeOverscroll($0) }) { _, raw in
+                    if !track.interacting { track.restOverscroll = raw }
+                    // Clamped so ordinary scrolling (negative overscroll) produces no pull.
+                    let value = max(raw, 0)
                     track.overscroll = value
                     guard track.interacting, track.eligible else { return }
                     onPull(value)
@@ -4985,7 +5003,7 @@ struct ConversationListView: View {
                         .coordinateSpace(name: "conversation-list-scroll")
                         .modifier(ScrollEdgePullTracker(
                             edge: .top,
-                            enabled: !workspaceLayerVisible && !workspaceOpen && selectedConversation == nil && search.isEmpty,
+                            enabled: !workspaceOpen && selectedConversation == nil && search.isEmpty,
                             onPull: updateWorkspacePull,
                             onRelease: finishWorkspacePull
                         ))
@@ -8895,15 +8913,13 @@ private struct MediaAlbumBubble: View {
     @State private var expanded = false
     @State private var frameBox = BubbleFrameBox()
 
-    private func press() { onLongPress(frameBox.frame) }
+    private func press() { onLongPress(frameBox.liveFrame) }
 
     private func activate(_ rect: CGRect) {
-        let box = frameBox.frame
-        if !box.isEmpty, box.insetBy(dx: -4, dy: -4).contains(CGPoint(x: rect.midX, y: rect.midY)) {
-            onLongPress(box)
-        } else {
-            onLongPress(rect.insetBy(dx: -14, dy: -9))
-        }
+        // Always anchor to the bubble's own frame; the tap point is only a last resort
+        // when the bubble has not been laid out yet.
+        let box = frameBox.liveFrame
+        onLongPress(box.isEmpty ? rect.insetBy(dx: -14, dy: -9) : box)
     }
     @Environment(\.chatPeerConversation) private var peer
 
@@ -9167,6 +9183,8 @@ private struct ChatTimeline: View, Equatable {
     let retractedIDs: Set<Int>
     let onReEdit: (Msg) -> Void
     let forwardedIDs: Set<Int>
+    /// Font and bubble style; part of equality so appearance changes redraw the rows.
+    var appearanceKey: String = ""
 
     /// 只有还没交给助手、且刚发不久的自己的消息才能撤回。
     private func canRetract(_ message: Msg) -> Bool {
@@ -9188,7 +9206,8 @@ private struct ChatTimeline: View, Equatable {
         lhs.selectedMessageID == rhs.selectedMessageID &&
         lhs.highlightedMessageID == rhs.highlightedMessageID &&
         lhs.unreadStartMessageID == rhs.unreadStartMessageID &&
-        lhs.bottomInset == rhs.bottomInset
+        lhs.bottomInset == rhs.bottomInset &&
+        lhs.appearanceKey == rhs.appearanceKey
     }
 
     private func albumMessages(id: String) -> [Msg] {
@@ -9544,11 +9563,17 @@ private struct ChatComposerView: View {
                 onSendVoice: sendRecordedVoice,
                 onSend: sendDraft
             )
-
-            if showingReactions {
-                reactionPanel
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
-            }
+        }
+        // Stickers open in a bottom sheet in place of the keyboard area, so the input bar
+        // stays at the bottom instead of being pushed up over the messages.
+        .sheet(isPresented: $showingReactions) {
+            reactionPanel
+                .padding(.horizontal, 12)
+                .padding(.top, 8)
+                .presentationDetents([.height(330), .large])
+                .presentationDragIndicator(.visible)
+                .presentationBackgroundInteraction(.enabled(upThrough: .height(330)))
+                .presentationCornerRadius(28)
         }
         .padding(.horizontal, 10)
         .padding(.top, 8)
@@ -9677,7 +9702,6 @@ private struct ChatComposerView: View {
     /// Sticker panel (stickers only).
     private var reactionPanel: some View {
         VStack(spacing: 10) {
-            panelHandle
             ScrollView {
                 LazyVGrid(
                     columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 4),
@@ -9706,11 +9730,10 @@ private struct ChatComposerView: View {
                     }
                 }
                 .padding(.horizontal, 4)
+                .padding(.top, 16)
             }
-            .frame(height: 240)
+            .frame(maxHeight: .infinity)
         }
-        .padding(12)
-        .modifier(NativeGlass(shape: RoundedRectangle(cornerRadius: 28, style: .continuous)))
     }
 
     private var panelHandle: some View {
@@ -9838,6 +9861,8 @@ private struct ChatComposerView: View {
 struct ChatView: View {
 
     @ObservedObject var store: ChatStore
+    @AppStorage(ChatFontChoice.storageKey) private var chatFontRaw = ChatFontChoice.system.rawValue
+    @AppStorage(ChatBubbleStyle.storageKey) private var chatBubbleStyleRaw = ChatBubbleStyle.glass.rawValue
     @Binding var isPinned: Bool
     let groupMembers: [AIConversation]
     let onCreateGroup: (AIConversation) -> Void
@@ -10033,7 +10058,7 @@ struct ChatView: View {
                 }
                 .padding(.horizontal, 18)
                 .padding(.vertical, 7)
-                .modifier(NativeGlass(shape: Capsule()))
+                .modifier(ToolbarMatchedGlass(shape: Capsule()))
             }
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
@@ -10279,7 +10304,8 @@ struct ChatView: View {
                             onReEdit: { message in
                                 reEditText = message.displayedText
                             },
-                            forwardedIDs: store.forwardedMessageIDs
+                            forwardedIDs: store.forwardedMessageIDs,
+                            appearanceKey: chatFontRaw + "|" + chatBubbleStyleRaw
                         )
                         .equatable()
                         .padding(.horizontal, 14)
@@ -10870,6 +10896,8 @@ private struct ComposerMenuRow: View {
 /// waveform (empty) or blue send arrow (text) inside on the right. Long-pressing
 /// the empty field records a voice clip; on release the review bar appears.
 private struct ChatInputRow: View {
+    @AppStorage(ChatFontChoice.storageKey) private var composerFontRaw = ChatFontChoice.system.rawValue
+    private var composerFont: ChatFontChoice { ChatFontChoice(rawValue: composerFontRaw) ?? .system }
     @Bindable var buffer: ChatDraftBuffer
     let inputFocused: FocusState<Bool>.Binding
     let isRecording: Bool
@@ -10904,8 +10932,9 @@ private struct ChatInputRow: View {
                     .accessibilityLabel("取消语音")
                 voiceBar(duration: recordedVoice.duration, live: false)
             } else {
-                circleButton(systemName: isRecording ? "xmark" : "plus", action: onTogglePlus)
-                    .rotationEffect(.degrees(menuOpen && !isRecording ? 45 : 0))
+                circleButton(systemName: isRecording ? "xmark" : "plus",
+                             rotation: menuOpen && !isRecording ? 45 : 0,
+                             action: onTogglePlus)
                     .animation(.spring(response: 0.3, dampingFraction: 0.8), value: menuOpen)
                     .opacity(isRecording ? 0.5 : 1)
                     .allowsHitTesting(!isRecording)
@@ -10927,6 +10956,7 @@ private struct ChatInputRow: View {
     private var field: some View {
         HStack(alignment: .bottom, spacing: 6) {
             TextField("信息", text: $buffer.text, axis: .vertical)
+                .font(composerFont.swiftUIFont)
                 .lineLimit(1...5)
                 .focused(inputFocused)
                 .padding(.leading, 16)
@@ -11042,15 +11072,21 @@ private struct ChatInputRow: View {
         return String(format: "%d:%02d", total / 60, total % 60)
     }
 
-    private func circleButton(systemName: String, action: @escaping () -> Void) -> some View {
+    /// Fixed 44pt glass circle. The glass is non-interactive and clipped to the button so
+    /// it can never grow or morph beyond the button; only the symbol rotates.
+    private func circleButton(systemName: String, rotation: Double = 0, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: systemName)
                 .font(.system(size: 20, weight: .medium))
+                .rotationEffect(.degrees(rotation))
                 .frame(width: 44, height: 44)
                 .contentShape(Circle())
         }
         .buttonStyle(.plain)
-        .modifier(NativeGlass(shape: Circle(), interactive: true))
+        .frame(width: 44, height: 44)
+        .modifier(NativeGlass(shape: Circle()))
+        .clipShape(Circle())
+        .fixedSize()
     }
 }
 
@@ -13188,6 +13224,36 @@ struct BubbleGlass<S: InsettableShape>: ViewModifier {
 /// Per-bubble frame holder; a reference type so geometry updates do not re-render the bubble.
 final class BubbleFrameBox {
     var frame: CGRect = .zero
+    /// UIKit view laid out exactly over the bubble. List cells are moved by UIKit while
+    /// scrolling, so SwiftUI geometry callbacks can lag behind; the probe is read at
+    /// trigger time to get the bubble's current window frame.
+    weak var probe: UIView?
+
+    /// Current global (window) frame of the bubble.
+    var liveFrame: CGRect {
+        if let probe, probe.window != nil {
+            let rect = probe.convert(probe.bounds, to: nil)
+            if !rect.isEmpty { frame = rect; return rect }
+        }
+        return frame
+    }
+}
+
+/// Invisible, non-interactive UIView used to read a bubble's live window frame.
+private struct BubbleFrameProbe: UIViewRepresentable {
+    let box: BubbleFrameBox
+
+    func makeUIView(context: Context) -> UIView {
+        let view = UIView()
+        view.isUserInteractionEnabled = false
+        view.backgroundColor = .clear
+        box.probe = view
+        return view
+    }
+
+    func updateUIView(_ view: UIView, context: Context) {
+        box.probe = view
+    }
 }
 
 /// Tracks a bubble's global frame into its own box and the id-keyed lookup table.
@@ -13198,6 +13264,7 @@ private struct BubbleFrameReporter: ViewModifier {
 
     func body(content: Content) -> some View {
         content
+            .background(BubbleFrameProbe(box: box).allowsHitTesting(false))
             .onGeometryChange(for: CGRect.self, of: { $0.frame(in: .global) }) { frame in
                 box.frame = frame
                 ChatTextSelection.messageFrames[messageID] = frame
@@ -13330,18 +13397,25 @@ enum ChatFontChoice: String, CaseIterable {
 private struct DropletHighlight: View {
     var body: some View {
         ZStack(alignment: .topLeading) {
+            // Soft white sheen behind the crescent.
+            Capsule()
+                .fill(Color.white.opacity(0.55))
+                .frame(width: 26, height: 7)
+                .blur(radius: 3)
+                .rotationEffect(.degrees(-18))
+                .offset(x: 6, y: 4)
             Circle()
-                .trim(from: 0.55, to: 0.71)
-                .stroke(Color.white.opacity(0.95), style: StrokeStyle(lineWidth: 2.6, lineCap: .round))
-                .frame(width: 30, height: 30)
-                .blur(radius: 0.4)
+                .trim(from: 0.55, to: 0.72)
+                .stroke(Color.white, style: StrokeStyle(lineWidth: 3.4, lineCap: .round))
+                .frame(width: 34, height: 34)
+                .shadow(color: Color.white.opacity(0.9), radius: 1.5)
             Circle()
-                .fill(Color.white.opacity(0.9))
-                .frame(width: 3.2, height: 3.2)
-                .offset(x: 19, y: 2.2)
+                .fill(Color.white)
+                .frame(width: 4, height: 4)
+                .offset(x: 22, y: 2)
         }
         .padding(.leading, 5)
-        .padding(.top, 3.5)
+        .padding(.top, 3)
         .allowsHitTesting(false)
     }
 }
@@ -13388,59 +13462,84 @@ struct ChatTextBubbleBackground: ViewModifier {
                 .environment(\.colorScheme, .light)
                 .background {
                     ZStack {
-                        // Very pale, semi-transparent tint; lighter towards the top.
-                        capsule.fill(tint.opacity(0.42))
+                        // Translucent tinted body.
+                        capsule.fill(tint.opacity(0.62))
+                        // Glossy upper half, slightly deeper lower edge for a rounded, filled look.
                         capsule.fill(LinearGradient(
-                            stops: [.init(color: Color.white.opacity(0.42), location: 0),
-                                    .init(color: Color.white.opacity(0.08), location: 0.55),
-                                    .init(color: tint.deepened(0.05).opacity(0.22), location: 1)],
+                            stops: [.init(color: Color.white.opacity(0.62), location: 0),
+                                    .init(color: Color.white.opacity(0.18), location: 0.42),
+                                    .init(color: Color.white.opacity(0), location: 0.62),
+                                    .init(color: tint.deepened(0.16).opacity(0.38), location: 1)],
                             startPoint: .top, endPoint: .bottom
                         ))
+                        // Soft inner glow just inside the rim.
+                        capsule
+                            .stroke(Color.white.opacity(0.85), lineWidth: 5)
+                            .blur(radius: 3.5)
+                            .clipShape(capsule)
                     }
                 }
                 .overlay {
-                    // Thin bright rim, slightly tinted along the lower edge.
+                    // Bright rim: white along the top, tinted along the bottom.
                     capsule.strokeBorder(
-                        LinearGradient(colors: [Color.white.opacity(0.98), Color.white.opacity(0.55), tint.deepened(0.1).opacity(0.45)],
+                        LinearGradient(colors: [Color.white, Color.white.opacity(0.7), tint.deepened(0.28).opacity(0.55)],
                                        startPoint: .top, endPoint: .bottom),
-                        lineWidth: 1
+                        lineWidth: 1.2
                     )
                 }
                 .overlay(alignment: .topLeading) { DropletHighlight() }
                 .compositingGroup()
-                .shadow(color: tint.deepened(0.22).opacity(0.32), radius: 5, y: 4)
-                .shadow(color: Color.black.opacity(0.05), radius: 1.5, y: 1)
+                .shadow(color: tint.deepened(0.32).opacity(0.38), radius: 2.5, y: 2.5)
+                .shadow(color: Color.black.opacity(0.07), radius: 7, y: 4)
         case .clay:
             let fill = Color(hexString: clayHex) ?? .white
-            let base = fill.deepened(0.14)
+            let base = fill.deepened(0.07)
             let capsule = RoundedRectangle(cornerRadius: 24, style: .continuous)
             content
                 .environment(\.colorScheme, .light)
                 .background {
                     ZStack {
-                        // Thicker, darker same-hue base protruding below the body.
+                        // Thin, soft base just below the body (about 3-4pt visible).
                         capsule.fill(base)
-                            .offset(y: 4.5)
-                            .blur(radius: 0.6)
+                            .offset(y: 3.5)
+                            .blur(radius: 1.6)
                         capsule.fill(fill)
-                        // Soft inner darkening right above the base, no top highlight.
+                        // Gentle shading towards the bottom edge; no top highlight.
                         capsule.fill(LinearGradient(
-                            stops: [.init(color: base.opacity(0), location: 0.68),
-                                    .init(color: base.opacity(0.28), location: 1)],
+                            stops: [.init(color: base.opacity(0), location: 0.55),
+                                    .init(color: base.opacity(0.45), location: 1)],
                             startPoint: .top, endPoint: .bottom
                         ))
+                        // Puffy inner softness around the rim.
+                        capsule
+                            .stroke(Color.white.opacity(0.45), lineWidth: 4)
+                            .blur(radius: 3)
+                            .offset(y: 1.5)
+                            .clipShape(capsule)
                     }
                 }
-                .padding(.bottom, 4.5)
+                .padding(.bottom, 3.5)
                 .compositingGroup()
-                .shadow(color: base.opacity(0.35), radius: 6, y: 5)
+                .shadow(color: base.deepened(0.1).opacity(0.22), radius: 8, y: 4)
         case .nativeGlass:
             content
-                .modifier(NativeGlass(shape: shape))
+                .modifier(ToolbarMatchedGlass(shape: shape))
         case .none:
             content
                 .shadow(color: Color.black.opacity(0.35), radius: 1.5, y: 0.5)
         }
+    }
+}
+
+/// The same light-scheme system glass the navigation bar uses for its buttons; shared by
+/// the chat title capsule and the native-glass bubble style so they render identically.
+struct ToolbarMatchedGlass<S: Shape>: ViewModifier {
+    let shape: S
+
+    func body(content: Content) -> some View {
+        content
+            .modifier(NativeGlass(shape: shape))
+            .environment(\.colorScheme, .light)
     }
 }
 
