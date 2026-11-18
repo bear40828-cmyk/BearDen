@@ -870,8 +870,12 @@ final class ChatStore: ObservableObject {
         // reactions/activities，不写任何 @Published。这样打字时页面不会
         // 每 5 秒被重绘一次；附属状态（对方正在输入、表情、动态）下次
         // 真有新消息时再一起补。
+        // The assistant's typing flag is reported by the bridge as soon as a reply
+        // starts streaming, before any message exists, so it is checked on every
+        // poll; it only writes state when the value actually changes.
+        Task { await refreshPeerTyping() }
         guard !fresh.isEmpty else { return }
-        Task { await refreshPeerTyping(); await refreshForwarded() }
+        Task { await refreshForwarded() }
         last = max(last, fresh.map(\.id).max() ?? last)
         // 首次只留最近一页进内存，剩下的历史往上翻时再按页取；
         // 新消息本来就只有几条，原样处理。
@@ -1992,6 +1996,17 @@ struct Bubble: View {
 
     private func press() { onLongPress(frameBox.frame) }
 
+    /// Menu trigger from a double tap; prefers the tracked bubble frame when it
+    /// covers the tapped spot, otherwise the rect reported at gesture time.
+    private func activate(_ rect: CGRect) {
+        let box = frameBox.frame
+        if !box.isEmpty, box.insetBy(dx: -4, dy: -4).contains(CGPoint(x: rect.midX, y: rect.midY)) {
+            onLongPress(box)
+        } else {
+            onLongPress(rect.insetBy(dx: -14, dy: -9))
+        }
+    }
+
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
             if mine {
@@ -2117,7 +2132,7 @@ struct Bubble: View {
             }
 
             if !text.isEmpty {
-                SelectableMarkdownText(text: text, onLongPress: press, selectionKey: "remote:\(msg.id)")
+                SelectableMarkdownText(text: text, onActivate: activate, selectionKey: "remote:\(msg.id)")
             }
 
             if let url = MessageURLDetector.firstWebURL(in: text) {
@@ -2127,6 +2142,12 @@ struct Bubble: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
         .modifier(ChatTextBubbleBackground(mine: mine))
+        .contentShape(Rectangle())
+        .simultaneousGesture(
+            SpatialTapGesture(count: 2, coordinateSpace: .global).onEnded { value in
+                activate(CGRect(origin: value.location, size: .zero).insetBy(dx: -1, dy: -1))
+            }
+        )
     }
 }
 
@@ -2297,14 +2318,15 @@ private func swiftMarkdown(_ source: String) -> AttributedString {
 }
 
 private func uiMarkdown(_ source: String, size: CGFloat) -> NSAttributedString {
-    let regular = UIFont.systemFont(ofSize: size)
+    let choice = ChatFontChoice.current
+    let regular = choice.uiFont(size: size)
     let result = NSMutableAttributedString(
         string: source,
         attributes: [.font: regular, .foregroundColor: UIColor.label]
     )
     let patterns: [(String, UIFont)] = [
-        (#"\*\*(.+?)\*\*"#, UIFont.boldSystemFont(ofSize: size)),
-        (#"__(.+?)__"#, UIFont.boldSystemFont(ofSize: size)),
+        (#"\*\*(.+?)\*\*"#, choice.uiFont(size: size, bold: true)),
+        (#"__(.+?)__"#, choice.uiFont(size: size, bold: true)),
         (#"`([^`]+)`"#, UIFont.monospacedSystemFont(ofSize: size - 0.5, weight: .regular))
     ]
     for (pattern, font) in patterns {
@@ -2405,6 +2427,19 @@ private struct ChatTranslateButton: View {
 
 private final class ChatSelectionTextView: UITextView {
     var selectionKey = ""
+    /// Custom double tap that opens the message menu; the built-in word-selection
+    /// double tap waits for it to fail so the two never both fire.
+    weak var menuDoubleTap: UITapGestureRecognizer?
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        guard window != nil, let menuDoubleTap else { return }
+        for recognizer in gestureRecognizers ?? [] where recognizer !== menuDoubleTap {
+            if let tap = recognizer as? UITapGestureRecognizer, tap.numberOfTapsRequired == 2 {
+                tap.require(toFail: menuDoubleTap)
+            }
+        }
+    }
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
         // 只在系统选字模式放开系统菜单；平时仍走自定义操作栏。
         guard ChatTextSelection.systemSelecting else { return false }
@@ -2412,11 +2447,14 @@ private final class ChatSelectionTextView: UITextView {
     }
 }
 
-// 直接在气泡内拖动选区；点一下文字唤起操作栏。
+// Double tap on the text opens the message menu; single taps (links) stay with UIKit.
 private struct SelectableMarkdownText: UIViewRepresentable {
     let text: String
-    let onLongPress: () -> Void
+    /// Called on double tap with the text view's frame in window coordinates.
+    let onActivate: (CGRect) -> Void
     var selectionKey: String = ""
+
+    private var renderKey: String { ChatFontChoice.current.rawValue + "|" + text }
 
     final class Coordinator: NSObject, UIGestureRecognizerDelegate, UITextViewDelegate {
         var parent: SelectableMarkdownText
@@ -2425,7 +2463,7 @@ private struct SelectableMarkdownText: UIViewRepresentable {
 
         init(_ parent: SelectableMarkdownText) {
             self.parent = parent
-            self.renderedSource = parent.text
+            self.renderedSource = parent.renderKey
             super.init()
             NotificationCenter.default.addObserver(
                 self,
@@ -2443,9 +2481,8 @@ private struct SelectableMarkdownText: UIViewRepresentable {
             textView.resignFirstResponder()
         }
 
-        @objc func held(_ recognizer: UILongPressGestureRecognizer) {
-            guard recognizer.state == .began else { return }
-            // 系统选字模式下长按交给系统，不再弹自定义菜单。
+        @objc func doubleTapped(_ recognizer: UITapGestureRecognizer) {
+            guard recognizer.state == .ended else { return }
             guard !ChatTextSelection.systemSelecting else { return }
             if let view = textView {
                 ChatTextSelection.tapPoint = recognizer.location(in: view)
@@ -2457,7 +2494,19 @@ private struct SelectableMarkdownText: UIViewRepresentable {
                 }
                 ChatTextSelection.active = view
             }
-            parent.onLongPress()
+            let rect = textView.map { $0.convert($0.bounds, to: nil) } ?? .zero
+            parent.onActivate(rect)
+            // Drop any word selection a system recognizer may have made on the same taps.
+            DispatchQueue.main.async { [weak self] in
+                guard let view = self?.textView, !ChatTextSelection.systemSelecting else { return }
+                if view.selectedRange.length > 0 { view.selectedRange = NSRange(location: 0, length: 0) }
+            }
+        }
+
+        func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+            // In system selection mode double taps belong to UIKit's word selection.
+            if gestureRecognizer is UITapGestureRecognizer { return !ChatTextSelection.systemSelecting }
+            return true
         }
 
         func textViewDidChangeSelection(_ textView: UITextView) {
@@ -2493,11 +2542,13 @@ private struct SelectableMarkdownText: UIViewRepresentable {
         v.adjustsFontForContentSizeCategory = true
         v.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         v.attributedText = uiMarkdown(text, size: 16)
-        let hold = UILongPressGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.held(_:)))
-        hold.minimumPressDuration = 0.34
-        hold.cancelsTouchesInView = false
-        hold.delegate = context.coordinator
-        v.addGestureRecognizer(hold)
+        let doubleTap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.doubleTapped(_:)))
+        doubleTap.numberOfTapsRequired = 2
+        doubleTap.cancelsTouchesInView = false
+        doubleTap.delaysTouchesEnded = false
+        doubleTap.delegate = context.coordinator
+        v.addGestureRecognizer(doubleTap)
+        v.menuDoubleTap = doubleTap
         context.coordinator.textView = v
         return v
     }
@@ -2505,8 +2556,8 @@ private struct SelectableMarkdownText: UIViewRepresentable {
     func updateUIView(_ v: UITextView, context: Context) {
         context.coordinator.parent = self
         (v as? ChatSelectionTextView)?.selectionKey = selectionKey
-        if context.coordinator.renderedSource != text {
-            context.coordinator.renderedSource = text
+        if context.coordinator.renderedSource != renderKey {
+            context.coordinator.renderedSource = renderKey
             v.attributedText = uiMarkdown(text, size: 16)
         }
     }
@@ -3604,7 +3655,7 @@ private struct LocalAIMessageBubble: View, Equatable {
                     }
                 }.buttonStyle(.plain)
             }
-            SelectableMarkdownText(text: message.text, onLongPress: { showsActions = true }, selectionKey: "local:\(message.id)")
+            SelectableMarkdownText(text: message.text, onActivate: { _ in showsActions = true }, selectionKey: "local:\(message.id)")
             if let url = MessageURLDetector.firstWebURL(in: message.text) {
                 MessageLinkPreviewCard(url: url)
             }
@@ -4368,11 +4419,17 @@ private struct ScrollEdgePullTracker: ViewModifier {
         if #available(iOS 18.0, *) {
             content
                 .onScrollPhaseChange { old, new, context in
-                    if new == .interacting {
-                        track.interacting = true
-                        // Must start from rest (not mid-momentum) with the content at the edge.
-                        track.eligible = enabled && old == .idle && abs(edgeOverscroll(context.geometry)) <= 1
-                        track.overscroll = 0
+                    if new == .tracking || new == .interacting {
+                        // A touch goes idle -> tracking -> interacting; checking only for
+                        // `.interacting` saw `old == .tracking` and never qualified.
+                        // Eligibility is decided once, when the touch lands: the content
+                        // must be resting (idle, not mid-momentum) at the edge. Scrolling
+                        // into the edge never qualifies.
+                        if !track.interacting {
+                            track.interacting = true
+                            track.eligible = enabled && old == .idle && abs(edgeOverscroll(context.geometry)) <= 1.5
+                            track.overscroll = 0
+                        }
                     } else if track.interacting {
                         track.interacting = false
                         if track.eligible { onRelease(track.overscroll) }
@@ -7713,6 +7770,53 @@ struct AddedAIChatView: View {
                 .modifier(BubbleGlass(shape: RoundedRectangle(cornerRadius: 24, style: .continuous)))
             }
 
+            if showingAttachments {
+                VStack(alignment: .leading, spacing: 2) {
+                    Button {
+                        showingAttachments = false
+                        showingCamera = true
+                    } label: {
+                        ComposerMenuRow(title: "相机", systemImage: "camera.fill", tint: .gray)
+                    }
+                    PhotosPicker(selection: $selectedPhotos, maxSelectionCount: 9, matching: .images) {
+                        ComposerMenuRow(title: "照片", systemImage: "photo.on.rectangle", tint: .orange)
+                    }
+                    Button {
+                        withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+                            showingAttachments = false
+                            showingReactions = true
+                        }
+                    } label: {
+                        ComposerMenuRow(title: "表情包", systemImage: "face.smiling.inverse", tint: .cyan)
+                    }
+                    Button {
+                        showingAttachments = false
+                        showingFilePicker = true
+                    } label: {
+                        ComposerMenuRow(title: "文件", systemImage: "folder.fill", tint: .blue)
+                    }
+                    Button {
+                        showingAttachments = false
+                        locationProvider.request { location in
+                            pendingAttachmentNames.append(String(
+                                format: "位置 %.6f, %.6f",
+                                location.coordinate.latitude,
+                                location.coordinate.longitude
+                            ))
+                        }
+                    } label: {
+                        ComposerMenuRow(title: locationProvider.isLocating ? "定位中" : "位置", systemImage: "location.fill", tint: .green)
+                    }
+                }
+                .buttonStyle(.plain)
+                .padding(.vertical, 10)
+                .padding(.horizontal, 8)
+                .frame(width: 230, alignment: .leading)
+                .modifier(NativeGlass(shape: RoundedRectangle(cornerRadius: 30, style: .continuous)))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .transition(.scale(scale: 0.85, anchor: .bottomLeading).combined(with: .opacity))
+            }
+
             ChatInputRow(
                 buffer: draftBuffer,
                 inputFocused: $inputFocused,
@@ -7720,95 +7824,34 @@ struct AddedAIChatView: View {
                 isTranscribing: voice.isTranscribing,
                 uploading: sending,
                 hasAttachments: !pendingFiles.isEmpty,
-                showingReactions: showingReactions,
+                menuOpen: showingAttachments || showingReactions,
+                recordingStartedAt: nil,
+                recordedVoice: nil,
+                previewPlaying: false,
                 onVoiceTap: toggleAddedAITranscription,
                 onHoldStart: beginAddedAIVoicePress,
                 onHoldEnd: endAddedAIVoicePress,
-                onToggleReactions: {
+                onTogglePlus: {
                     inputFocused = false
-                    showingAttachments = false
                     withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
-                        showingReactions.toggle()
+                        if showingAttachments || showingReactions {
+                            showingAttachments = false
+                            showingReactions = false
+                        } else {
+                            showingAttachments = true
+                        }
                     }
                 },
-                onOpenAttachments: {
-                    inputFocused = false
-                    showingReactions = false
-                    withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
-                        showingAttachments.toggle()
-                    }
-                },
+                onDiscardVoice: {},
+                onPlayVoice: {},
+                onSendVoice: {},
                 onSend: sendMessage
             )
-
-            if showingAttachments {
-                VStack(spacing: 4) {
-                    Capsule().fill(Color.secondary.opacity(0.35)).frame(width: 38, height: 4)
-                    HStack(spacing: 0) {
-                        PhotosPicker(selection: $selectedPhotos, maxSelectionCount: 9, matching: .images) {
-                            AttachmentTile(title: "照片", systemImage: "photo")
-                        }
-                        Button {
-                            showingAttachments = false
-                            showingCamera = true
-                        } label: {
-                            AttachmentTile(title: "拍摄", systemImage: "camera.fill")
-                        }
-                        Button {
-                            showingAttachments = false
-                            showingFilePicker = true
-                        } label: {
-                            AttachmentTile(title: "文件", systemImage: "folder.fill")
-                        }
-                        Button {
-                            locationProvider.request { location in
-                                pendingAttachmentNames.append(String(
-                                    format: "位置 %.6f, %.6f",
-                                    location.coordinate.latitude,
-                                    location.coordinate.longitude
-                                ))
-                            }
-                        } label: {
-                            AttachmentTile(
-                                title: locationProvider.isLocating ? "定位中" : "位置",
-                                systemImage: "location.fill"
-                            )
-                        }
-                    }
-                    .buttonStyle(.plain)
-                }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 9)
-                .modifier(BubbleGlass(shape: RoundedRectangle(cornerRadius: 27, style: .continuous)))
-            }
 
             if showingReactions {
                 VStack(spacing: 10) {
                     Capsule().fill(Color.secondary.opacity(0.35)).frame(width: 38, height: 4)
-                    HStack(spacing: 10) {
-                        addedAIReactionTab("Emoji", systemImage: "face.smiling", page: .emoji)
-                        addedAIReactionTab("表情包", systemImage: "heart", page: .stickers)
-                        Spacer()
-                    }
-                    Divider().opacity(0.22)
                     ScrollView {
-                        if reactionPage == .emoji {
-                            LazyVGrid(
-                                columns: Array(repeating: GridItem(.flexible(), spacing: 7), count: 7),
-                                spacing: 9
-                            ) {
-                                ForEach(Self.emojis, id: \.self) { emoji in
-                                    Button {
-                                        draftBuffer.text.append(emoji)
-                                    } label: {
-                                        Text(emoji)
-                                            .font(.system(size: 27))
-                                            .frame(maxWidth: .infinity, minHeight: 42)
-                                    }
-                                    .buttonStyle(.plain)
-                                }
-                            }
-                        } else {
                             LazyVGrid(
                                 columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 4),
                                 spacing: 10
@@ -7835,12 +7878,11 @@ struct AddedAIChatView: View {
                                     .buttonStyle(.plain)
                                 }
                             }
-                        }
                     }
-                    .frame(height: 220)
+                    .frame(height: 240)
                 }
                 .padding(12)
-                .modifier(BubbleGlass(shape: RoundedRectangle(cornerRadius: 27, style: .continuous)))
+                .modifier(NativeGlass(shape: RoundedRectangle(cornerRadius: 27, style: .continuous)))
             }
         }
         .padding(.horizontal, 10)
@@ -8854,6 +8896,15 @@ private struct MediaAlbumBubble: View {
     @State private var frameBox = BubbleFrameBox()
 
     private func press() { onLongPress(frameBox.frame) }
+
+    private func activate(_ rect: CGRect) {
+        let box = frameBox.frame
+        if !box.isEmpty, box.insetBy(dx: -4, dy: -4).contains(CGPoint(x: rect.midX, y: rect.midY)) {
+            onLongPress(box)
+        } else {
+            onLongPress(rect.insetBy(dx: -14, dy: -9))
+        }
+    }
     @Environment(\.chatPeerConversation) private var peer
 
     private var mine: Bool { messages.first?.from == "me" }
@@ -8913,7 +8964,7 @@ private struct MediaAlbumBubble: View {
                             .buttonStyle(.plain)
                         }
                         if !displayedCaption.isEmpty {
-                            SelectableMarkdownText(text: displayedCaption, onLongPress: press, selectionKey: "album:\(messages.first?.id ?? 0)")
+                            SelectableMarkdownText(text: displayedCaption, onActivate: activate, selectionKey: "album:\(messages.first?.id ?? 0)")
                         }
                     }
                     .padding(.horizontal, 14)
@@ -9356,15 +9407,14 @@ private final class ChatDraftBuffer {
 // body 就跟着跑一遍；现在草稿、表情面板页签、语音按住态都归这个子树所有，
 // 打字只重画输入框这一块，聊天页本身不再被每一次按键触动。
 private struct ChatComposerView: View {
-    private enum ReactionPage {
-        case emoji
-        case stickers
-    }
-
     @State private var draftBuffer = ChatDraftBuffer()
     @State private var draftSaveTask: Task<Void, Never>?
-    @State private var reactionPage: ReactionPage = .emoji
     @State private var voicePressActive = false
+    /// Finished recording waiting in the review bar (discard / play / send).
+    @State private var recordedVoice: RecordedVoice?
+    @State private var voicePreview: AVAudioPlayer?
+    @State private var voicePreviewPlaying = false
+    @State private var recordingStartedAt: Date?
 
     let draftKey: String
     let peerName: String
@@ -9458,6 +9508,12 @@ private struct ChatComposerView: View {
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
 
+            if showingAttachments {
+                attachmentMenu
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .transition(.scale(scale: 0.85, anchor: .bottomLeading).combined(with: .opacity))
+            }
+
             ChatInputRow(
                 buffer: draftBuffer,
                 inputFocused: inputFocused,
@@ -9465,31 +9521,29 @@ private struct ChatComposerView: View {
                 isTranscribing: voice.isTranscribing,
                 uploading: uploading,
                 hasAttachments: !pendingAttachments.isEmpty,
-                showingReactions: showingReactions,
+                menuOpen: showingAttachments || showingReactions,
+                recordingStartedAt: recordingStartedAt,
+                recordedVoice: recordedVoice,
+                previewPlaying: voicePreviewPlaying,
                 onVoiceTap: toggleTranscription,
                 onHoldStart: beginVoicePress,
                 onHoldEnd: endVoicePress,
-                onToggleReactions: {
+                onTogglePlus: {
                     inputFocused.wrappedValue = false
-                    showingAttachments = false
                     withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
-                        showingReactions.toggle()
+                        if showingAttachments || showingReactions {
+                            showingAttachments = false
+                            showingReactions = false
+                        } else {
+                            showingAttachments = true
+                        }
                     }
                 },
-                onOpenAttachments: {
-                    inputFocused.wrappedValue = false
-                    showingReactions = false
-                    withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
-                        showingAttachments.toggle()
-                    }
-                },
+                onDiscardVoice: discardRecordedVoice,
+                onPlayVoice: togglePreviewPlayback,
+                onSendVoice: sendRecordedVoice,
                 onSend: sendDraft
             )
-
-            if showingAttachments {
-                attachmentPanel
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
-            }
 
             if showingReactions {
                 reactionPanel
@@ -9556,30 +9610,38 @@ private struct ChatComposerView: View {
             }
         }
         .padding(10)
-        .modifier(Glass(shape: RoundedRectangle(cornerRadius: 24, style: .continuous)))
+        .modifier(NativeGlass(shape: RoundedRectangle(cornerRadius: 24, style: .continuous)))
     }
 
-    private var attachmentPanel: some View {
-        VStack(spacing: 3) {
-            panelHandle
-            HStack(spacing: 0) {
-                PhotosPicker(selection: $selectedPhotos, maxSelectionCount: 9, matching: .any(of: [.images, .videos])) {
-                    AttachmentTile(title: "照片", systemImage: "photo")
-                }
-
+    /// Vertical glass menu opened by the round plus button, iMessage style.
+    private var attachmentMenu: some View {
+        VStack(alignment: .leading, spacing: 2) {
             Button {
                 guard UIImagePickerController.isSourceTypeAvailable(.camera) else { return }
                 showingAttachments = false
                 showingCamera = true
             } label: {
-                AttachmentTile(title: "拍摄", systemImage: "camera.fill")
+                ComposerMenuRow(title: "相机", systemImage: "camera.fill", tint: .gray)
+            }
+
+            PhotosPicker(selection: $selectedPhotos, maxSelectionCount: 9, matching: .any(of: [.images, .videos])) {
+                ComposerMenuRow(title: "照片", systemImage: "photo.on.rectangle", tint: .orange)
+            }
+
+            Button {
+                withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
+                    showingAttachments = false
+                    showingReactions = true
+                }
+            } label: {
+                ComposerMenuRow(title: "表情包", systemImage: "face.smiling.inverse", tint: .cyan)
             }
 
             Button {
                 showingAttachments = false
                 showingFilePicker = true
             } label: {
-                AttachmentTile(title: "文件", systemImage: "folder.fill")
+                ComposerMenuRow(title: "文件", systemImage: "folder.fill", tint: .blue)
             }
 
             Button {
@@ -9593,10 +9655,7 @@ private struct ChatComposerView: View {
                     }
                 }
             } label: {
-                AttachmentTile(
-                    title: locationProvider.isLocating ? "定位中" : "位置",
-                    systemImage: "location.fill"
-                )
+                ComposerMenuRow(title: locationProvider.isLocating ? "定位中" : "位置", systemImage: "location.fill", tint: .green)
             }
 
             if ServerConfig.workbenchWebURL != nil {
@@ -9604,82 +9663,54 @@ private struct ChatComposerView: View {
                     showingAttachments = false
                     showingQuota = true
                 } label: {
-                    AttachmentTile(title: "额度", systemImage: "gauge.with.dots.needle.33percent")
+                    ComposerMenuRow(title: "额度", systemImage: "gauge.with.dots.needle.33percent", tint: .yellow)
                 }
             }
-
-            }
-            .buttonStyle(.plain)
         }
+        .buttonStyle(.plain)
+        .padding(.vertical, 10)
         .padding(.horizontal, 8)
-        .padding(.bottom, 10)
-        .modifier(Glass(shape: RoundedRectangle(cornerRadius: 28, style: .continuous)))
+        .frame(width: 230, alignment: .leading)
+        .modifier(NativeGlass(shape: RoundedRectangle(cornerRadius: 30, style: .continuous)))
     }
 
+    /// Sticker panel (stickers only).
     private var reactionPanel: some View {
         VStack(spacing: 10) {
             panelHandle
-            HStack(spacing: 10) {
-                reactionTab(title: "Emoji", systemImage: "face.smiling", page: .emoji)
-                reactionTab(title: "表情包", systemImage: "heart", page: .stickers)
-                Spacer()
-            }
-
-            Divider().opacity(0.22)
-
             ScrollView {
-                if reactionPage == .emoji {
-                    LazyVGrid(
-                        columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 7),
-                        spacing: 12
-                    ) {
-                        ForEach(emojis, id: \.self) { emoji in
-                            Button {
-                                draftBuffer.text.append(emoji)
-                            } label: {
-                                Text(emoji)
-                                    .font(.system(size: 29))
-                                    .frame(maxWidth: .infinity, minHeight: 46)
-                                    .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
+                LazyVGrid(
+                    columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 4),
+                    spacing: 10
+                ) {
+                    PhotosPicker(selection: $stickerPhoto, matching: .images) {
+                        VStack(spacing: 4) {
+                            Image(systemName: "plus")
+                                .font(.system(size: 24, weight: .medium))
+                            Text("添加")
+                                .font(.system(size: 11, weight: .medium))
                         }
+                        .frame(maxWidth: .infinity)
+                        .aspectRatio(1, contentMode: .fit)
+                        .background(Color.white.opacity(0.16), in: RoundedRectangle(cornerRadius: 15, style: .continuous))
                     }
-                    .padding(.horizontal, 4)
-                } else {
-                    LazyVGrid(
-                        columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 4),
-                        spacing: 10
-                    ) {
-                        PhotosPicker(selection: $stickerPhoto, matching: .images) {
-                            VStack(spacing: 4) {
-                                Image(systemName: "plus")
-                                    .font(.system(size: 24, weight: .medium))
-                                Text("添加")
-                                    .font(.system(size: 11, weight: .medium))
-                            }
-                            .frame(maxWidth: .infinity)
-                            .aspectRatio(1, contentMode: .fit)
-                            .background(Color.white.opacity(0.16), in: RoundedRectangle(cornerRadius: 15, style: .continuous))
+                    .buttonStyle(.plain)
+
+                    ForEach(stickers.items) { sticker in
+                        Button {
+                            onSendSticker(sticker)
+                        } label: {
+                            StickerThumbnail(url: sticker.url)
                         }
                         .buttonStyle(.plain)
-
-                        ForEach(stickers.items) { sticker in
-                            Button {
-                                onSendSticker(sticker)
-                            } label: {
-                                StickerThumbnail(url: sticker.url)
-                            }
-                            .buttonStyle(.plain)
-                        }
                     }
-                    .padding(.horizontal, 4)
                 }
+                .padding(.horizontal, 4)
             }
-            .frame(height: 220)
+            .frame(height: 240)
         }
         .padding(12)
-        .modifier(Glass(shape: RoundedRectangle(cornerRadius: 28, style: .continuous)))
+        .modifier(NativeGlass(shape: RoundedRectangle(cornerRadius: 28, style: .continuous)))
     }
 
     private var panelHandle: some View {
@@ -9710,30 +9741,6 @@ private struct ChatComposerView: View {
         }
     }
 
-    private func reactionTab(
-        title: String,
-        systemImage: String,
-        page: ReactionPage
-    ) -> some View {
-        Button {
-            withAnimation(.easeInOut(duration: 0.18)) {
-                reactionPage = page
-            }
-        } label: {
-            Label(title, systemImage: systemImage)
-                .font(.system(size: 14, weight: .semibold))
-                .padding(.horizontal, 13)
-                .padding(.vertical, 8)
-                .background(
-                    reactionPage == page ? Color.white.opacity(0.25) : Color.clear,
-                    in: Capsule()
-                )
-                .frame(minHeight: 44)
-                .contentShape(Capsule())
-        }
-        .buttonStyle(.plain)
-    }
-
     private func toggleTranscription() {
         inputFocused.wrappedValue = false
         if voice.isTranscribing {
@@ -9755,18 +9762,64 @@ private struct ChatComposerView: View {
         showingReactions = false
         showingAttachments = false
         voicePressActive = true
+        discardRecordedVoice()
         Task {
             do {
                 try await voice.startRecording(shouldStart: { voicePressActive })
+                if voice.isRecording { recordingStartedAt = Date() }
             } catch {
                 onVoiceError(error.localizedDescription)
             }
         }
     }
 
+    /// Releasing the press stops recording and leaves the clip in the review bar.
     private func endVoicePress() {
         voicePressActive = false
+        recordingStartedAt = nil
         guard let url = voice.finishRecording() else { return }
+        withAnimation(.easeOut(duration: 0.18)) {
+            recordedVoice = RecordedVoice(url: url, duration: voice.lastRecordingDuration)
+        }
+    }
+
+    private func discardRecordedVoice() {
+        voicePreview?.stop()
+        voicePreview = nil
+        voicePreviewPlaying = false
+        if let clip = recordedVoice {
+            try? FileManager.default.removeItem(at: clip.url)
+        }
+        recordedVoice = nil
+    }
+
+    private func togglePreviewPlayback() {
+        guard let clip = recordedVoice else { return }
+        if voicePreviewPlaying {
+            voicePreview?.pause()
+            voicePreviewPlaying = false
+            return
+        }
+        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
+        try? AVAudioSession.sharedInstance().setActive(true)
+        if voicePreview == nil { voicePreview = try? AVAudioPlayer(contentsOf: clip.url) }
+        guard let player = voicePreview else { return }
+        player.play()
+        voicePreviewPlaying = true
+        let length = max(player.duration - player.currentTime, 0.1)
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(length))
+            if voicePreview === player, !player.isPlaying { voicePreviewPlaying = false }
+        }
+    }
+
+    private func sendRecordedVoice() {
+        guard let clip = recordedVoice, !uploading else { return }
+        voicePreview?.stop()
+        voicePreview = nil
+        voicePreviewPlaying = false
+        recordedVoice = nil
+        let url = clip.url
         Task {
             uploading = true
             defer { uploading = false }
@@ -9798,8 +9851,6 @@ struct ChatView: View {
     @State private var selectedMessageID: Int?
     /// Global frame of the long-pressed bubble, captured at press time.
     @State private var menuAnchorFrame: CGRect = .zero
-    /// Global origin of the chat area; converts bubble frames into overlay coordinates.
-    @State private var chatAreaOrigin: CGPoint = .zero
     @State private var reactionTargetID: Int?
     @State private var replyingTo: Msg?
     @State private var reEditText: String?
@@ -9982,7 +10033,7 @@ struct ChatView: View {
                 }
                 .padding(.horizontal, 18)
                 .padding(.vertical, 7)
-                .modifier(Glass(shape: Capsule()))
+                .modifier(NativeGlass(shape: Capsule()))
             }
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
@@ -10190,14 +10241,12 @@ struct ChatView: View {
                             onSelectActions: { messageID, frame in
                                 // 系统选字模式下长按交给系统，不再弹菜单。
                                 guard !isSystemSelecting else { return }
+                                // Frame of the gesture's own bubble, captured when the gesture fired.
+                                // Repeated triggers on the same bubble keep the menu open.
                                 menuAnchorFrame = frame
                                 withAnimation(.spring(response: 0.22, dampingFraction: 0.86)) {
-                                    let next = selectedMessageID == messageID ? nil : messageID
-                                    selectedMessageID = next
-                                    isSelectingText = next != nil
-                                    if next == nil {
-                                        NotificationCenter.default.post(name: .clearChatTextSelection, object: nil)
-                                    }
+                                    selectedMessageID = messageID
+                                    isSelectingText = true
                                 }
                             },
                             onReact: { messageID, emoji in
@@ -10261,18 +10310,6 @@ struct ChatView: View {
                             if selectedMessageID != nil { selectionNonce += 1 }
                         }
 
-                    if let selectedID = selectedMessageID,
-                       let selectedMsg = timelineMessages.first(where: { $0.id == selectedID }) {
-                        // Frame reported by the selected message's own bubble (keyed by id),
-                        // falling back to the frame captured at press time.
-                        let global = ChatTextSelection.messageFrames[selectedID] ?? menuAnchorFrame
-                        messageMenu(
-                            msg: selectedMsg,
-                            frame: global.offsetBy(dx: -chatAreaOrigin.x, dy: -chatAreaOrigin.y),
-                            geo: geo
-                        )
-                    }
-
                     ChatComposerView(
                         draftKey: draftKey,
                         peerName: peerName,
@@ -10309,9 +10346,22 @@ struct ChatView: View {
                         onSendSticker: { sticker in sendSticker(sticker) },
                         onStagePhotos: { items in stagePhotos(items) }
                     )
-                }
-                .onGeometryChange(for: CGPoint.self, of: { $0.frame(in: .global).origin }) { origin in
-                    chatAreaOrigin = origin
+
+                    if let selectedID = selectedMessageID,
+                       let selectedMsg = timelineMessages.first(where: { $0.id == selectedID }) {
+                        // Topmost layer so neither the composer nor the list can swallow taps.
+                        // The anchor is the global frame captured at gesture time; it is
+                        // converted into this layer's own coordinate space.
+                        GeometryReader { layer in
+                            let origin = layer.frame(in: .global).origin
+                            messageMenu(
+                                msg: selectedMsg,
+                                frame: menuAnchorFrame.offsetBy(dx: -origin.x, dy: -origin.y),
+                                geo: geo
+                            )
+                        }
+                        .zIndex(5)
+                    }
                 }
                 .task {
                     guard !initialScrollReady else { return }
@@ -10788,6 +10838,37 @@ struct ChatView: View {
     }
 }
 
+struct RecordedVoice: Equatable {
+    let url: URL
+    let duration: TimeInterval
+}
+
+/// One row of the plus menu: colored round icon and title.
+private struct ComposerMenuRow: View {
+    let title: String
+    let systemImage: String
+    let tint: Color
+
+    var body: some View {
+        HStack(spacing: 14) {
+            Image(systemName: systemImage)
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(width: 36, height: 36)
+                .background(tint.gradient, in: Circle())
+            Text(title)
+                .font(.system(size: 17, weight: .medium))
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .contentShape(Rectangle())
+    }
+}
+
+/// iMessage-style input bar: round plus on the left, long capsule field with a
+/// waveform (empty) or blue send arrow (text) inside on the right. Long-pressing
+/// the empty field records a voice clip; on release the review bar appears.
 private struct ChatInputRow: View {
     @Bindable var buffer: ChatDraftBuffer
     let inputFocused: FocusState<Bool>.Binding
@@ -10795,13 +10876,20 @@ private struct ChatInputRow: View {
     let isTranscribing: Bool
     let uploading: Bool
     let hasAttachments: Bool
-    let showingReactions: Bool
+    let menuOpen: Bool
+    let recordingStartedAt: Date?
+    let recordedVoice: RecordedVoice?
+    let previewPlaying: Bool
     let onVoiceTap: () -> Void
     let onHoldStart: () -> Void
     let onHoldEnd: () -> Void
-    let onToggleReactions: () -> Void
-    let onOpenAttachments: () -> Void
+    let onTogglePlus: () -> Void
+    let onDiscardVoice: () -> Void
+    let onPlayVoice: () -> Void
+    let onSendVoice: () -> Void
     let onSend: (String) -> Void
+
+    private static let sendBlue = Color(red: 0.23, green: 0.56, blue: 0.98)
 
     private var hasText: Bool {
         !buffer.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -10810,76 +10898,159 @@ private struct ChatInputRow: View {
     private var canSend: Bool { hasText || hasAttachments }
 
     var body: some View {
-        HStack(alignment: .bottom, spacing: 6) {
-            Image(systemName: isRecording ? "waveform" : (isTranscribing ? "mic.fill" : "waveform.circle"))
-                .font(.system(size: 24, weight: .medium))
-                .frame(width: 42, height: 44)
-                .modifier(Glass(shape: Circle()))
-                .overlay {
-                    VoicePressSurface(
-                        onTap: onVoiceTap,
-                        onHoldStart: onHoldStart,
-                        onHoldEnd: onHoldEnd
-                    )
-                }
-                .accessibilityLabel("轻点语音转文字，长按发送语音")
-
-            TextField("输入消息", text: $buffer.text, axis: .vertical)
-                .lineLimit(1...4)
-                .focused(inputFocused)
-                .padding(.horizontal, 13)
-                .padding(.vertical, 11)
-                .frame(minWidth: 70, minHeight: 44)
-                .modifier(Glass(shape: Capsule()))
-
-            circleButton(
-                systemName: showingReactions ? "keyboard" : "face.smiling",
-                fontSize: 23,
-                action: onToggleReactions
-            )
-            .accessibilityLabel("表情")
-
-            circleButton(systemName: "plus", fontSize: 21, action: onOpenAttachments)
-                .accessibilityLabel("添加附件")
-
-            Button {
-                guard canSend, !uploading else { return }
-                let outgoing = buffer.text
-                buffer.text = ""
-                onSend(outgoing)
-            } label: {
-                Group {
-                    if uploading {
-                        ProgressView()
-                    } else {
-                        Image(systemName: "arrow.up")
-                            .font(.system(size: 19, weight: .semibold))
+        HStack(alignment: .bottom, spacing: 8) {
+            if let recordedVoice {
+                circleButton(systemName: "xmark", action: onDiscardVoice)
+                    .accessibilityLabel("取消语音")
+                voiceBar(duration: recordedVoice.duration, live: false)
+            } else {
+                circleButton(systemName: isRecording ? "xmark" : "plus", action: onTogglePlus)
+                    .rotationEffect(.degrees(menuOpen && !isRecording ? 45 : 0))
+                    .animation(.spring(response: 0.3, dampingFraction: 0.8), value: menuOpen)
+                    .opacity(isRecording ? 0.5 : 1)
+                    .allowsHitTesting(!isRecording)
+                    .accessibilityLabel("更多")
+                // The field (and its hold recognizer) stays mounted while recording so
+                // the release still reaches it; the live bar is drawn on top.
+                field
+                    .opacity(isRecording ? 0.001 : 1)
+                    .overlay {
+                        if isRecording {
+                            voiceBar(duration: nil, live: true)
+                                .allowsHitTesting(false)
+                        }
                     }
-                }
-                .frame(width: 42, height: 44)
-                .contentShape(Circle())
             }
-            .buttonStyle(.plain)
-            .modifier(Glass(shape: Circle()))
-            .opacity(canSend ? 1 : 0.42)
-            .disabled(!canSend || uploading)
-            .accessibilityLabel("发送")
         }
     }
 
-    private func circleButton(
-        systemName: String,
-        fontSize: CGFloat,
-        action: @escaping () -> Void
-    ) -> some View {
+    private var field: some View {
+        HStack(alignment: .bottom, spacing: 6) {
+            TextField("信息", text: $buffer.text, axis: .vertical)
+                .lineLimit(1...5)
+                .focused(inputFocused)
+                .padding(.leading, 16)
+                .padding(.vertical, 11)
+                .overlay {
+                    // Empty, unfocused field: tap focuses, long press records.
+                    if !hasText && !inputFocused.wrappedValue {
+                        VoicePressSurface(
+                            onTap: { inputFocused.wrappedValue = true },
+                            onHoldStart: onHoldStart,
+                            onHoldEnd: onHoldEnd
+                        )
+                    }
+                }
+
+            Group {
+                if canSend || uploading {
+                    Button {
+                        guard canSend, !uploading else { return }
+                        let outgoing = buffer.text
+                        buffer.text = ""
+                        onSend(outgoing)
+                    } label: {
+                        Group {
+                            if uploading {
+                                ProgressView().tint(.white)
+                            } else {
+                                Image(systemName: "arrow.up")
+                                    .font(.system(size: 16, weight: .bold))
+                                    .foregroundStyle(.white)
+                            }
+                        }
+                        .frame(width: 36, height: 32)
+                        .background(Self.sendBlue, in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(uploading)
+                    .accessibilityLabel("发送")
+                } else {
+                    Button(action: onVoiceTap) {
+                        Image(systemName: "waveform")
+                            .font(.system(size: 18, weight: .medium))
+                            .foregroundStyle(isTranscribing ? Color.pink : Color.secondary)
+                            .symbolEffect(.variableColor.iterative, isActive: isTranscribing)
+                            .frame(width: 36, height: 32)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(isTranscribing ? "停止语音转文字" : "语音转文字，长按输入框录音")
+                }
+            }
+            .padding(.trailing, 6)
+            .padding(.bottom, 6)
+        }
+        .frame(minHeight: 44)
+        .modifier(NativeGlass(shape: RoundedRectangle(cornerRadius: 22, style: .continuous), interactive: true))
+    }
+
+    private func voiceBar(duration: TimeInterval?, live: Bool) -> some View {
+        HStack(spacing: 12) {
+            Button(action: onPlayVoice) {
+                Image(systemName: live ? "mic.fill" : (previewPlaying ? "pause.fill" : "play.fill"))
+                    .font(.system(size: 15, weight: .bold))
+                    .foregroundStyle(live ? Color.red : Color.primary)
+                    .frame(width: 34, height: 34)
+                    .background(Color.primary.opacity(0.12), in: Circle())
+            }
+            .buttonStyle(.plain)
+            .disabled(live)
+
+            HStack(spacing: 3) {
+                ForEach(0..<18, id: \.self) { i in
+                    Capsule()
+                        .fill(Color.primary.opacity(0.65))
+                        .frame(width: 2.5, height: live ? CGFloat(6 + (i * 7) % 11) : 8)
+                }
+            }
+            .frame(maxWidth: .infinity)
+
+            Group {
+                if live, let start = recordingStartedAt {
+                    TimelineView(.periodic(from: start, by: 0.5)) { context in
+                        Text("+ " + Self.clock(context.date.timeIntervalSince(start)))
+                    }
+                } else {
+                    Text("+ " + Self.clock(duration ?? 0))
+                }
+            }
+            .font(.system(size: 15, weight: .medium).monospacedDigit())
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(Color.primary.opacity(0.10), in: Capsule())
+
+            Button(action: onSendVoice) {
+                Image(systemName: "arrow.up")
+                    .font(.system(size: 16, weight: .bold))
+                    .foregroundStyle(.white)
+                    .frame(width: 40, height: 32)
+                    .background(Self.sendBlue, in: Capsule())
+            }
+            .buttonStyle(.plain)
+            .disabled(live || uploading)
+            .opacity(live ? 0.45 : 1)
+            .accessibilityLabel("发送语音")
+        }
+        .padding(.horizontal, 8)
+        .frame(height: 48)
+        .modifier(NativeGlass(shape: Capsule(), interactive: true))
+    }
+
+    private static func clock(_ seconds: TimeInterval) -> String {
+        let total = max(Int(seconds.rounded()), 0)
+        return String(format: "%d:%02d", total / 60, total % 60)
+    }
+
+    private func circleButton(systemName: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: systemName)
-                .font(.system(size: fontSize, weight: .medium))
-                .frame(width: 42, height: 44)
+                .font(.system(size: 20, weight: .medium))
+                .frame(width: 44, height: 44)
                 .contentShape(Circle())
         }
         .buttonStyle(.plain)
-        .modifier(Glass(shape: Circle()))
+        .modifier(NativeGlass(shape: Circle(), interactive: true))
     }
 }
 
@@ -11674,10 +11845,8 @@ struct MeView: View {
                                 profileMenuRow("相册", systemImage: "photo.stack")
                             }.buttonStyle(.plain)
                             Divider().opacity(0.24)
-                            Button {
-                                showingMomentsBackgroundPicker = true
-                            } label: {
-                                profileMenuRow("朋友圈背景", systemImage: "photo.on.rectangle.angled")
+                            NavigationLink { ThemeSettingsView() } label: {
+                                profileMenuRow("主题", systemImage: "paintpalette")
                             }
                             .buttonStyle(.plain)
 
@@ -12345,12 +12514,8 @@ struct SettingsView: View {
 
             ScrollView {
                 VStack(spacing: 14) {
-                    identityCard
                     serverCard
                     capabilityCard
-                    backgroundCard
-                    appearanceCard
-                    aboutCard
                 }
                 .padding(.horizontal, 14)
                 .padding(.top, 6)
@@ -12360,79 +12525,13 @@ struct SettingsView: View {
         .navigationTitle("")
         .navigationBarTitleDisplayMode(.inline)
         .toolbarBackground(.hidden, for: .navigationBar)
-        .onAppear { loadPreview() }
         .onDisappear { normalizeServerAddress() }
-        .onChange(of: backgroundPhoto) { _, item in
-            saveHomeBackground(item)
-        }
         .onChange(of: myAvatarPhoto) { _, item in
             saveAvatarPhoto(item, assistant: false)
         }
         .onChange(of: assistantAvatarPhoto) { _, item in
             saveAvatarPhoto(item, assistant: true)
         }
-    }
-
-    // 名字和头像：存在本机，聊天、朋友圈、收藏、相册里显示的名字和头像都读这里。
-    private var identityCard: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("名字与头像")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(.secondary)
-
-            HStack(spacing: 12) {
-                Text("我的名字").foregroundStyle(.secondary)
-                Spacer(minLength: 12)
-                TextField("我的名字", text: $myNickname)
-                    .fontWeight(.medium)
-                    .multilineTextAlignment(.trailing)
-                    .submitLabel(.done)
-            }
-
-            Divider().opacity(0.24)
-
-            HStack(spacing: 12) {
-                Text("AI 助手名字").foregroundStyle(.secondary)
-                Spacer(minLength: 12)
-                TextField("助手名字", text: $assistantRemark)
-                    .fontWeight(.medium)
-                    .multilineTextAlignment(.trailing)
-                    .submitLabel(.done)
-            }
-
-            Divider().opacity(0.24)
-
-            HStack(spacing: 12) {
-                MyAvatar(size: 44)
-                Text("我的头像").foregroundStyle(.secondary)
-                Spacer(minLength: 12)
-                PhotosPicker(selection: $myAvatarPhoto, matching: .images) {
-                    Text("更换").font(.system(size: 14, weight: .semibold))
-                }
-                .buttonStyle(.plain)
-                Button("恢复默认") { removeMyAvatar() }
-                    .font(.system(size: 14, weight: .semibold))
-                    .buttonStyle(.plain)
-            }
-
-            Divider().opacity(0.24)
-
-            HStack(spacing: 12) {
-                ContactAvatar(kind: .claude, size: 44)
-                Text("AI 助手头像").foregroundStyle(.secondary)
-                Spacer(minLength: 12)
-                PhotosPicker(selection: $assistantAvatarPhoto, matching: .images) {
-                    Text("更换").font(.system(size: 14, weight: .semibold))
-                }
-                .buttonStyle(.plain)
-                Button("恢复默认") { removeAssistantAvatar() }
-                    .font(.system(size: 14, weight: .semibold))
-                    .buttonStyle(.plain)
-            }
-        }
-        .font(.system(size: 15))
-        .padding(15)
-        .modifier(Glass(shape: RoundedRectangle(cornerRadius: 24, style: .continuous)))
     }
 
     private var serverCard: some View {
@@ -12510,6 +12609,213 @@ struct SettingsView: View {
         .modifier(Glass(shape: RoundedRectangle(cornerRadius: 24, style: .continuous)))
     }
 
+    private func settingsLine(icon: String, title: String, detail: String) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: icon)
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(.pink)
+                .frame(width: 24)
+            Text(title)
+                .font(.system(size: 16, weight: .medium))
+            Spacer()
+            if !detail.isEmpty {
+                Text(detail)
+                    .font(.system(size: 13))
+                    .foregroundStyle(.secondary)
+            }
+            Image(systemName: "chevron.right")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.tertiary)
+        }
+        .padding(.vertical, 14)
+    }
+
+}
+
+/// Theme page: bubble style, colors and font, plus home, chat and moments backgrounds.
+struct ThemeSettingsView: View {
+    @AppStorage("homeBgVersion") private var homeBgVersion = 0
+    @AppStorage("appearanceMode") private var appearanceMode = "light"
+    @AppStorage("momentsBgVersion") private var momentsBackgroundVersion = 0
+    @AppStorage(ChatBubbleStyle.storageKey) private var bubbleStyle = ChatBubbleStyle.glass.rawValue
+    @AppStorage(ChatFontChoice.storageKey) private var fontChoice = ChatFontChoice.system.rawValue
+    @State private var backgroundPhoto: PhotosPickerItem?
+    @State private var backgroundPreview: UIImage?
+    @State private var showingChatBackground = false
+    @State private var showingMomentsBackground = false
+
+    private var currentStyle: ChatBubbleStyle { ChatBubbleStyle(rawValue: bubbleStyle) ?? .glass }
+
+    var body: some View {
+        ZStack {
+            AppBackdrop()
+            ScrollView {
+                VStack(spacing: 14) {
+                    bubbleCard
+                    fontCard
+                    appearanceCard
+                    backgroundCard
+                    otherBackgroundsCard
+                }
+                .padding(.horizontal, 14)
+                .padding(.top, 6)
+                .padding(.bottom, 110)
+            }
+        }
+        .navigationTitle("主题")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbarBackground(.hidden, for: .navigationBar)
+        .onAppear { loadPreview() }
+        .onChange(of: backgroundPhoto) { _, item in saveHomeBackground(item) }
+        .sheet(isPresented: $showingChatBackground) {
+            ChatBackgroundChoice()
+                .presentationDetents([.height(300)])
+        }
+        .sheet(isPresented: $showingMomentsBackground) {
+            NativeMomentsBackgroundPicker(backgroundVersion: $momentsBackgroundVersion)
+                .presentationDetents([.height(270)])
+                .presentationDragIndicator(.visible)
+        }
+    }
+
+    private func sectionTitle(_ title: String) -> some View {
+        Text(title)
+            .font(.system(size: 13, weight: .semibold))
+            .foregroundStyle(.secondary)
+    }
+
+    private var bubbleCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            sectionTitle("气泡样式")
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 3), spacing: 8) {
+                ForEach(ChatBubbleStyle.allCases, id: \.rawValue) { style in
+                    Button {
+                        bubbleStyle = style.rawValue
+                    } label: {
+                        Text(style.title)
+                            .font(.system(size: 14, weight: .semibold))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                            .background(
+                                currentStyle == style ? Color.pink.opacity(0.18) : Color.white.opacity(0.10),
+                                in: Capsule()
+                            )
+                            .overlay(Capsule().strokeBorder(currentStyle == style ? Color.pink.opacity(0.55) : .clear, lineWidth: 1))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            bubblePreview
+
+            if currentStyle.supportsColor {
+                Divider().opacity(0.24)
+                BubbleColorRow(title: "我的气泡", style: currentStyle, mine: true)
+                BubbleColorRow(title: "对方气泡", style: currentStyle, mine: false)
+            }
+        }
+        .padding(15)
+        .modifier(Glass(shape: RoundedRectangle(cornerRadius: 24, style: .continuous)))
+    }
+
+    private var bubblePreview: some View {
+        VStack(spacing: 10) {
+            HStack {
+                Text("今天也想你")
+                    .font(ChatFontChoice(rawValue: fontChoice)?.swiftUIFont ?? .body)
+                    .padding(.horizontal, 14).padding(.vertical, 9)
+                    .modifier(ChatTextBubbleBackground(mine: false))
+                Spacer()
+            }
+            HStack {
+                Spacer()
+                Text("我也是")
+                    .font(ChatFontChoice(rawValue: fontChoice)?.swiftUIFont ?? .body)
+                    .padding(.horizontal, 14).padding(.vertical, 9)
+                    .modifier(ChatTextBubbleBackground(mine: true))
+            }
+        }
+        .id(bubbleStyle + fontChoice)
+        .padding(12)
+        .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+
+    private var fontCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            sectionTitle("聊天字体")
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 4), spacing: 8) {
+                ForEach(ChatFontChoice.allCases, id: \.rawValue) { choice in
+                    Button {
+                        fontChoice = choice.rawValue
+                    } label: {
+                        VStack(spacing: 2) {
+                            Text("Aa 字").font(choice.swiftUIFont)
+                            Text(choice.title).font(.system(size: 11)).foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 8)
+                        .background(
+                            fontChoice == choice.rawValue ? Color.pink.opacity(0.18) : Color.white.opacity(0.10),
+                            in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            Text("中文字符在部分字体下会使用系统字形。")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+        }
+        .padding(15)
+        .modifier(Glass(shape: RoundedRectangle(cornerRadius: 24, style: .continuous)))
+    }
+
+    private var appearanceCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            sectionTitle("外观")
+            Picker("外观", selection: $appearanceMode) {
+                Text("跟随系统").tag("system")
+                Text("浅色").tag("light")
+                Text("深色").tag("dark")
+            }
+            .pickerStyle(.segmented)
+        }
+        .padding(15)
+        .modifier(Glass(shape: RoundedRectangle(cornerRadius: 24, style: .continuous)))
+    }
+
+    private var otherBackgroundsCard: some View {
+        VStack(spacing: 0) {
+            Button { showingChatBackground = true } label: {
+                themeLine(icon: "bubble.left.and.bubble.right", title: "聊天背景")
+            }
+            .buttonStyle(.plain)
+            Divider().opacity(0.24)
+            Button { showingMomentsBackground = true } label: {
+                themeLine(icon: "photo.on.rectangle.angled", title: "朋友圈背景")
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 15)
+        .modifier(Glass(shape: RoundedRectangle(cornerRadius: 24, style: .continuous)))
+    }
+
+    private func themeLine(icon: String, title: String) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: icon)
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(.pink)
+                .frame(width: 24)
+            Text(title).font(.system(size: 16, weight: .medium))
+            Spacer()
+            Image(systemName: "chevron.right")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.tertiary)
+        }
+        .padding(.vertical, 14)
+        .contentShape(Rectangle())
+    }
+
     private var backgroundCard: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("主页背景")
@@ -12540,7 +12846,7 @@ struct SettingsView: View {
                 .buttonStyle(.plain)
 
                 Button {
-                    try? FileManager.default.removeItem(at: Self.homeBgPath)
+                    try? FileManager.default.removeItem(at: SettingsView.homeBgPath)
                     backgroundPreview = nil
                     homeBgVersion = 0
                 } label: {
@@ -12557,73 +12863,8 @@ struct SettingsView: View {
         .modifier(Glass(shape: RoundedRectangle(cornerRadius: 24, style: .continuous)))
     }
 
-    private var appearanceCard: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Label("外观", systemImage: "circle.lefthalf.filled")
-                .font(.system(size: 16, weight: .semibold))
-
-            Picker("外观", selection: $appearanceMode) {
-                Text("跟随系统").tag("system")
-                Text("浅色").tag("light")
-                Text("深色").tag("dark")
-            }
-            .pickerStyle(.segmented)
-
-            Divider().opacity(0.24)
-
-            Text("气泡样式")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(.secondary)
-            Picker("气泡样式", selection: $bubbleStyle) {
-                ForEach(ChatBubbleStyle.allCases, id: \.rawValue) { style in
-                    Text(style.title).tag(style.rawValue)
-                }
-            }
-            .pickerStyle(.segmented)
-        }
-        .padding(15)
-        .modifier(Glass(shape: RoundedRectangle(cornerRadius: 24, style: .continuous)))
-    }
-
-    private var aboutCard: some View {
-        NavigationLink {
-            AboutView()
-        } label: {
-            settingsLine(
-                icon: "info.circle.fill",
-                title: "关于熊窝",
-                detail: "版本 0.8.8"
-            )
-            .padding(.horizontal, 15)
-            .padding(.vertical, 2)
-            .modifier(Glass(shape: RoundedRectangle(cornerRadius: 24, style: .continuous)))
-        }
-        .buttonStyle(.plain)
-    }
-
-    private func settingsLine(icon: String, title: String, detail: String) -> some View {
-        HStack(spacing: 12) {
-            Image(systemName: icon)
-                .font(.system(size: 17, weight: .semibold))
-                .foregroundStyle(.pink)
-                .frame(width: 24)
-            Text(title)
-                .font(.system(size: 16, weight: .medium))
-            Spacer()
-            if !detail.isEmpty {
-                Text(detail)
-                    .font(.system(size: 13))
-                    .foregroundStyle(.secondary)
-            }
-            Image(systemName: "chevron.right")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.tertiary)
-        }
-        .padding(.vertical, 14)
-    }
-
     private func loadPreview() {
-        backgroundPreview = homeBgVersion > 0 ? UIImage(contentsOfFile: Self.homeBgPath.path) : nil
+        backgroundPreview = homeBgVersion > 0 ? UIImage(contentsOfFile: SettingsView.homeBgPath.path) : nil
     }
 
     private func saveHomeBackground(_ item: PhotosPickerItem?) {
@@ -12633,7 +12874,7 @@ struct SettingsView: View {
             if let data = try? await item.loadTransferable(type: Data.self),
                let image = UIImage(data: data) {
                 let jpg = downscale(image, maxSide: 1600)
-                try? jpg.write(to: Self.homeBgPath, options: .atomic)
+                try? jpg.write(to: SettingsView.homeBgPath, options: .atomic)
                 let preview = UIImage(data: jpg)
                 await MainActor.run {
                     backgroundPreview = preview
@@ -12642,6 +12883,46 @@ struct SettingsView: View {
                         AppBackdropImageCache.store(preview, version: homeBgVersion)
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Preset swatches plus a free color picker for one side of a bubble style.
+private struct BubbleColorRow: View {
+    let title: String
+    let style: ChatBubbleStyle
+    let mine: Bool
+    @AppStorage private var hex: String
+
+    init(title: String, style: ChatBubbleStyle, mine: Bool) {
+        self.title = title
+        self.style = style
+        self.mine = mine
+        _hex = AppStorage(wrappedValue: ChatBubblePalette.defaultHex(style, mine: mine),
+                          ChatBubblePalette.key(style, mine: mine))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title).font(.system(size: 14, weight: .medium))
+            HStack(spacing: 8) {
+                ForEach(ChatBubblePalette.presets(style), id: \.self) { preset in
+                    Button { hex = preset } label: {
+                        Circle()
+                            .fill(Color(hexString: preset) ?? .white)
+                            .frame(width: 28, height: 28)
+                            .overlay(Circle().strokeBorder(Color.black.opacity(0.08), lineWidth: 0.5))
+                            .overlay(Circle().strokeBorder(hex.uppercased() == preset ? Color.pink : .clear, lineWidth: 2).padding(-3))
+                    }
+                    .buttonStyle(.plain)
+                }
+                Spacer(minLength: 0)
+                ColorPicker("", selection: Binding(
+                    get: { Color(hexString: hex) ?? .white },
+                    set: { hex = $0.hexString }
+                ), supportsOpacity: false)
+                .labelsHidden()
             }
         }
     }
@@ -12933,23 +13214,154 @@ private struct BubbleFrameReporter: ViewModifier {
 }
 
 enum ChatBubbleStyle: String, CaseIterable {
-    case glass, droplet, clay, none
+    case glass, droplet, clay, nativeGlass, none
     static let storageKey = "chatBubbleStyle"
     var title: String {
         switch self {
         case .glass: return "玻璃"
         case .droplet: return "水珠"
         case .clay: return "黏土"
+        case .nativeGlass: return "原生玻璃"
         case .none: return "无气泡"
         }
     }
+    /// Styles whose tint can be chosen per side.
+    var supportsColor: Bool { self == .droplet || self == .clay }
 }
 
-/// Text bubble background. All variants are flat fills, gradients and shadows only
-/// (no materials or live blur) so they stay cheap in a scrolling list.
+/// Per-style, per-side bubble tint stored as a hex string.
+enum ChatBubblePalette {
+    static func key(_ style: ChatBubbleStyle, mine: Bool) -> String {
+        "chatBubbleColor.\(style.rawValue).\(mine ? "mine" : "peer")"
+    }
+
+    static func defaultHex(_ style: ChatBubbleStyle, mine: Bool) -> String {
+        switch style {
+        case .clay: return mine ? "F6C9D6" : "CFE0F7"
+        default: return mine ? "F7DDE4" : "DCE8F5"
+        }
+    }
+
+    static let dropletPresets = ["F7DDE4", "DCE8F5", "DDF0E6", "F7F1D8", "ECE6F5", "F8E3D4", "E9ECEF"]
+    static let clayPresets = ["F6C9D6", "CFE0F7", "D4F0C8", "FBF0C4", "DCD3F3", "FAD6C0", "E3E6EA"]
+
+    static func presets(_ style: ChatBubbleStyle) -> [String] {
+        style == .clay ? clayPresets : dropletPresets
+    }
+
+    static func color(_ style: ChatBubbleStyle, mine: Bool) -> Color {
+        let raw = UserDefaults.standard.string(forKey: key(style, mine: mine)) ?? defaultHex(style, mine: mine)
+        return Color(hexString: raw) ?? Color(hexString: defaultHex(style, mine: mine)) ?? .white
+    }
+}
+
+extension Color {
+    init?(hexString: String) {
+        let cleaned = hexString.trimmingCharacters(in: CharacterSet(charactersIn: "# ")).uppercased()
+        guard cleaned.count == 6, let value = UInt32(cleaned, radix: 16) else { return nil }
+        self.init(
+            red: Double((value >> 16) & 0xFF) / 255,
+            green: Double((value >> 8) & 0xFF) / 255,
+            blue: Double(value & 0xFF) / 255
+        )
+    }
+
+    var hexString: String {
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        UIColor(self).getRed(&r, green: &g, blue: &b, alpha: &a)
+        func c(_ v: CGFloat) -> Int { Int((min(max(v, 0), 1) * 255).rounded()) }
+        return String(format: "%02X%02X%02X", c(r), c(g), c(b))
+    }
+
+    /// Same hue, more saturated and darker; used for clay bases and droplet shadows.
+    func deepened(_ amount: CGFloat = 0.16) -> Color {
+        var h: CGFloat = 0, s: CGFloat = 0, v: CGFloat = 0, a: CGFloat = 0
+        UIColor(self).getHue(&h, saturation: &s, brightness: &v, alpha: &a)
+        return Color(hue: Double(h), saturation: Double(min(s * 1.35 + 0.08, 1)), brightness: Double(max(v - amount, 0)))
+    }
+}
+
+/// Chat text font choice, applied to message text.
+enum ChatFontChoice: String, CaseIterable {
+    case system, rounded, serif, monospaced, chalkboard, noteworthy, avenir
+    static let storageKey = "chatFontChoice"
+
+    var title: String {
+        switch self {
+        case .system: return "系统"
+        case .rounded: return "圆体"
+        case .serif: return "衬线"
+        case .monospaced: return "等宽"
+        case .chalkboard: return "粉笔"
+        case .noteworthy: return "手写"
+        case .avenir: return "Avenir"
+        }
+    }
+
+    static var current: ChatFontChoice {
+        ChatFontChoice(rawValue: UserDefaults.standard.string(forKey: storageKey) ?? "") ?? .system
+    }
+
+    func uiFont(size: CGFloat, bold: Bool = false) -> UIFont {
+        let weight: UIFont.Weight = bold ? .bold : .regular
+        let base = UIFont.systemFont(ofSize: size, weight: weight)
+        func designed(_ design: UIFontDescriptor.SystemDesign) -> UIFont {
+            guard let d = base.fontDescriptor.withDesign(design) else { return base }
+            return UIFont(descriptor: d, size: size)
+        }
+        func named(_ regular: String, _ boldName: String) -> UIFont {
+            UIFont(name: bold ? boldName : regular, size: size) ?? base
+        }
+        switch self {
+        case .system: return base
+        case .rounded: return designed(.rounded)
+        case .serif: return designed(.serif)
+        case .monospaced: return designed(.monospaced)
+        case .chalkboard: return named("ChalkboardSE-Regular", "ChalkboardSE-Bold")
+        case .noteworthy: return named("Noteworthy-Light", "Noteworthy-Bold")
+        case .avenir: return named("AvenirNext-Regular", "AvenirNext-Bold")
+        }
+    }
+
+    var swiftUIFont: Font { Font(uiFont(size: 16)) }
+}
+
+/// Upper-left crescent highlight used by the droplet bubble.
+private struct DropletHighlight: View {
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            Circle()
+                .trim(from: 0.55, to: 0.71)
+                .stroke(Color.white.opacity(0.95), style: StrokeStyle(lineWidth: 2.6, lineCap: .round))
+                .frame(width: 30, height: 30)
+                .blur(radius: 0.4)
+            Circle()
+                .fill(Color.white.opacity(0.9))
+                .frame(width: 3.2, height: 3.2)
+                .offset(x: 19, y: 2.2)
+        }
+        .padding(.leading, 5)
+        .padding(.top, 3.5)
+        .allowsHitTesting(false)
+    }
+}
+
+/// Text bubble background. Custom variants are flat fills, gradients and shadows only
+/// (no materials or live blur) so they stay cheap in a scrolling list; the native glass
+/// variant uses the system glass effect.
 struct ChatTextBubbleBackground: ViewModifier {
     let mine: Bool
     @AppStorage(ChatBubbleStyle.storageKey) private var styleRaw = ChatBubbleStyle.glass.rawValue
+    @AppStorage private var dropletHex: String
+    @AppStorage private var clayHex: String
+
+    init(mine: Bool) {
+        self.mine = mine
+        _dropletHex = AppStorage(wrappedValue: ChatBubblePalette.defaultHex(.droplet, mine: mine),
+                                 ChatBubblePalette.key(.droplet, mine: mine))
+        _clayHex = AppStorage(wrappedValue: ChatBubblePalette.defaultHex(.clay, mine: mine),
+                              ChatBubblePalette.key(.clay, mine: mine))
+    }
 
     private var style: ChatBubbleStyle { ChatBubbleStyle(rawValue: styleRaw) ?? .glass }
     private var shape: RoundedRectangle { RoundedRectangle(cornerRadius: 22, style: .continuous) }
@@ -12970,59 +13382,83 @@ struct ChatTextBubbleBackground: ViewModifier {
                 .compositingGroup()
                 .shadow(color: Color.black.opacity(0.05), radius: 8, y: 2)
         case .droplet:
-            let capsule = RoundedRectangle(cornerRadius: 26, style: .continuous)
-            content
-                .environment(\.colorScheme, .light)
-                .background {
-                    capsule.fill(LinearGradient(
-                        colors: mine
-                            ? [Color(red: 1.0, green: 0.93, blue: 0.95), Color(red: 0.99, green: 0.85, blue: 0.89)]
-                            : [Color(red: 0.97, green: 0.99, blue: 1.0), Color(red: 0.86, green: 0.93, blue: 0.99)],
-                        startPoint: .top, endPoint: .bottom
-                    ))
-                }
-                .overlay(alignment: .top) {
-                    // Thin highlight along the top inner edge.
-                    capsule
-                        .inset(by: 1.5)
-                        .stroke(
-                            LinearGradient(colors: [Color.white.opacity(0.9), Color.white.opacity(0)],
-                                           startPoint: .top, endPoint: .center),
-                            lineWidth: 1.5
-                        )
-                }
-                .compositingGroup()
-                .shadow(color: (mine ? Color(red: 0.85, green: 0.55, blue: 0.65) : Color(red: 0.5, green: 0.65, blue: 0.85)).opacity(0.22),
-                        radius: 10, y: 5)
-        case .clay:
-            let fill = mine ? Color(red: 0.97, green: 0.78, blue: 0.85) : Color(red: 0.84, green: 0.87, blue: 0.97)
-            let deep = mine ? Color(red: 0.86, green: 0.58, blue: 0.69) : Color(red: 0.64, green: 0.69, blue: 0.86)
+            let tint = Color(hexString: dropletHex) ?? .white
+            let capsule = RoundedRectangle(cornerRadius: 24, style: .continuous)
             content
                 .environment(\.colorScheme, .light)
                 .background {
                     ZStack {
-                        shape.fill(fill)
-                        // Darker same-hue strip along the bottom edge (faux inner shadow).
-                        shape.fill(LinearGradient(
-                            stops: [.init(color: deep.opacity(0), location: 0.62),
-                                    .init(color: deep.opacity(0.55), location: 1)],
-                            startPoint: .top, endPoint: .bottom
-                        ))
-                        // Subtle top highlight.
-                        shape.fill(LinearGradient(
-                            stops: [.init(color: Color.white.opacity(0.45), location: 0),
-                                    .init(color: Color.white.opacity(0), location: 0.3)],
+                        // Very pale, semi-transparent tint; lighter towards the top.
+                        capsule.fill(tint.opacity(0.42))
+                        capsule.fill(LinearGradient(
+                            stops: [.init(color: Color.white.opacity(0.42), location: 0),
+                                    .init(color: Color.white.opacity(0.08), location: 0.55),
+                                    .init(color: tint.deepened(0.05).opacity(0.22), location: 1)],
                             startPoint: .top, endPoint: .bottom
                         ))
                     }
-                    .clipShape(shape)
                 }
+                .overlay {
+                    // Thin bright rim, slightly tinted along the lower edge.
+                    capsule.strokeBorder(
+                        LinearGradient(colors: [Color.white.opacity(0.98), Color.white.opacity(0.55), tint.deepened(0.1).opacity(0.45)],
+                                       startPoint: .top, endPoint: .bottom),
+                        lineWidth: 1
+                    )
+                }
+                .overlay(alignment: .topLeading) { DropletHighlight() }
                 .compositingGroup()
-                .shadow(color: deep.opacity(0.28), radius: 7, y: 4)
+                .shadow(color: tint.deepened(0.22).opacity(0.32), radius: 5, y: 4)
+                .shadow(color: Color.black.opacity(0.05), radius: 1.5, y: 1)
+        case .clay:
+            let fill = Color(hexString: clayHex) ?? .white
+            let base = fill.deepened(0.14)
+            let capsule = RoundedRectangle(cornerRadius: 24, style: .continuous)
+            content
+                .environment(\.colorScheme, .light)
+                .background {
+                    ZStack {
+                        // Thicker, darker same-hue base protruding below the body.
+                        capsule.fill(base)
+                            .offset(y: 4.5)
+                            .blur(radius: 0.6)
+                        capsule.fill(fill)
+                        // Soft inner darkening right above the base, no top highlight.
+                        capsule.fill(LinearGradient(
+                            stops: [.init(color: base.opacity(0), location: 0.68),
+                                    .init(color: base.opacity(0.28), location: 1)],
+                            startPoint: .top, endPoint: .bottom
+                        ))
+                    }
+                }
+                .padding(.bottom, 4.5)
+                .compositingGroup()
+                .shadow(color: base.opacity(0.35), radius: 6, y: 5)
+        case .nativeGlass:
+            content
+                .modifier(NativeGlass(shape: shape))
         case .none:
             content
                 .shadow(color: Color.black.opacity(0.35), radius: 1.5, y: 0.5)
         }
+    }
+}
+
+/// System Liquid Glass on iOS 26; material fallback on earlier systems.
+struct NativeGlass<S: Shape>: ViewModifier {
+    let shape: S
+    var interactive = false
+
+    func body(content: Content) -> some View {
+#if compiler(>=6.2)
+        if #available(iOS 26.0, *) {
+            content.glassEffect(interactive ? .regular.interactive() : .regular, in: shape)
+        } else {
+            content.background(.ultraThinMaterial, in: shape)
+        }
+#else
+        content.background(.ultraThinMaterial, in: shape)
+#endif
     }
 }
 
@@ -13192,9 +13628,13 @@ final class VoiceController: ObservableObject {
         isRecording = true
     }
 
+    /// Length of the clip returned by the last `finishRecording()`.
+    private(set) var lastRecordingDuration: TimeInterval = 0
+
     func finishRecording() -> URL? {
         guard let recorder, let url = recordingURL else { return nil }
         let duration = recorder.currentTime
+        lastRecordingDuration = duration
         recorder.stop()
         self.recorder = nil
         recordingURL = nil
