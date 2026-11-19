@@ -2136,8 +2136,7 @@ struct Bubble: View {
                 MessageLinkPreviewCard(url: url)
             }
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 9)
+        .modifier(ChatTextBubblePadding())
         .modifier(ChatTextBubbleBackground(mine: mine))
     }
 }
@@ -4456,6 +4455,7 @@ private struct WorkspaceLauncherView: View {
     var body: some View {
         ZStack {
             AppBackdrop()
+                .ignoresSafeArea()
 
             ScrollView {
                 VStack(spacing: 24) {
@@ -5106,9 +5106,9 @@ struct ConversationListView: View {
     }
 
     private var workspaceRevealProgress: CGFloat {
-        if workspaceOpen {
-            return max(0.82, 1 - (workspaceCloseDistance / 1_600))
-        }
+        // While open (including a close swipe) the workspace and its backdrop stay put;
+        // only the front home layer slides back down over them.
+        if workspaceOpen { return 1 }
         return min(max(workspacePullDistance / 220, 0), 1)
     }
 
@@ -9023,8 +9023,7 @@ private struct MediaAlbumBubble: View {
                             SelectableMarkdownText(text: displayedCaption, selectionKey: selectionKey)
                         }
                     }
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 9)
+                    .modifier(ChatTextBubblePadding())
                     .modifier(ChatTextBubbleBackground(mine: mine))
                 }
 
@@ -9596,6 +9595,8 @@ private struct ChatComposerView: View {
                 onSendVoice: sendRecordedVoice,
                 onSend: sendDraft
             )
+            // With the bar's 10pt this gives a 28pt inset per side, matching the system Messages bar.
+            .padding(.horizontal, 18)
         }
         // Stickers open in a bottom sheet in place of the keyboard area, so the input bar
         // stays at the bottom instead of being pushed up over the messages.
@@ -10825,7 +10826,7 @@ private struct ChatInputRow: View {
     private var canSend: Bool { hasText || hasAttachments }
 
     var body: some View {
-        HStack(alignment: .bottom, spacing: 8) {
+        HStack(alignment: .bottom, spacing: 12) {
             if let recordedVoice {
                 circleButton(systemName: "xmark", action: onDiscardVoice)
                     .accessibilityLabel("取消语音")
@@ -10859,7 +10860,7 @@ private struct ChatInputRow: View {
                 .lineLimit(1...5)
                 .focused(inputFocused)
                 .padding(.leading, 16)
-                .padding(.vertical, 11)
+                .padding(.vertical, 9)
                 .overlay {
                     // Empty, unfocused field: tap focuses, long press records.
                     if !hasText && !inputFocused.wrappedValue {
@@ -10908,10 +10909,10 @@ private struct ChatInputRow: View {
                 }
             }
             .padding(.trailing, 6)
-            .padding(.bottom, 6)
+            .padding(.bottom, 4)
         }
-        .frame(minHeight: 44)
-        .modifier(NativeGlass(shape: RoundedRectangle(cornerRadius: 22, style: .continuous), interactive: true))
+        .frame(minHeight: 40)
+        .modifier(NativeGlass(shape: RoundedRectangle(cornerRadius: 20, style: .continuous), interactive: true))
     }
 
     private func voiceBar(duration: TimeInterval?, live: Bool) -> some View {
@@ -10978,11 +10979,11 @@ private struct ChatInputRow: View {
             Image(systemName: systemName)
                 .font(.system(size: 20, weight: .medium))
                 .rotationEffect(.degrees(rotation))
-                .frame(width: 44, height: 44)
+                .frame(width: 40, height: 40)
                 .contentShape(Circle())
         }
         .buttonStyle(.plain)
-        .frame(width: 44, height: 44)
+        .frame(width: 40, height: 40)
         .modifier(NativeGlass(shape: Circle()))
         .clipShape(Circle())
         .fixedSize()
@@ -13392,12 +13393,69 @@ struct ChatTextBubbleBackground: ViewModifier {
                 .compositingGroup()
                 .shadow(color: Color(red: 90/255, green: 60/255, blue: 120/255).opacity(0.18), radius: 12, x: 10, y: 14)
         case .nativeGlass:
+            // Message-app proportions: 18pt continuous corners, light side tint, no tail.
+            let tint = (Color(hexString: dropletHex) ?? .white).opacity(0.22)
             content
-                .modifier(ToolbarMatchedGlass(shape: shape))
+                .modifier(TintedNativeGlass(shape: RoundedRectangle(cornerRadius: 18, style: .continuous), tint: tint))
+                .environment(\.colorScheme, .light)
         case .none:
             content
                 .shadow(color: Color.black.opacity(0.35), radius: 1.5, y: 0.5)
         }
+    }
+}
+
+/// Inner padding for text bubbles; the native glass style uses message-app metrics
+/// (12pt horizontal, 8pt vertical, bubble capped at 75% of the screen width).
+struct ChatTextBubblePadding: ViewModifier {
+    @AppStorage(ChatBubbleStyle.storageKey) private var styleRaw = ChatBubbleStyle.glass.rawValue
+
+    func body(content: Content) -> some View {
+        if ChatBubbleStyle(rawValue: styleRaw) == .nativeGlass {
+            MaxWidthLayout(maxWidth: UIScreen.main.bounds.width * 0.75) {
+                content
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+            }
+        } else {
+            content
+                .padding(.horizontal, 14)
+                .padding(.vertical, 9)
+        }
+    }
+}
+
+/// Caps the width proposed to its single child without stretching it.
+struct MaxWidthLayout: Layout {
+    let maxWidth: CGFloat
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        guard let child = subviews.first else { return .zero }
+        let width = min(proposal.width ?? maxWidth, maxWidth)
+        return child.sizeThatFits(ProposedViewSize(width: width, height: proposal.height))
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        guard let child = subviews.first else { return }
+        child.place(at: bounds.origin, proposal: ProposedViewSize(width: bounds.width, height: bounds.height))
+    }
+}
+
+/// Regular system glass lightly tinted; material fallback before iOS 26.
+struct TintedNativeGlass<S: Shape>: ViewModifier {
+    let shape: S
+    let tint: Color
+
+    func body(content: Content) -> some View {
+#if compiler(>=6.2)
+        if #available(iOS 26.0, *) {
+            content.glassEffect(.regular.tint(tint), in: shape)
+        } else {
+            content.background(.ultraThinMaterial, in: shape)
+        }
+#else
+        content.background(.ultraThinMaterial, in: shape)
+#endif
     }
 }
 
