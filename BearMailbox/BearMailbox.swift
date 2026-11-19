@@ -818,7 +818,16 @@ final class ChatStore: ObservableObject {
         isPeerTyping = false
     }
 
-    private func resumeFromBackground() {
+    func resumeFromBackground() {
+        guard started, localPeer == nil else { return }
+        // iOS may tear down the timer's run loop source and in-flight sockets while
+        // suspended; rebuild the 5 second poll so new replies arrive without a relaunch.
+        timer?.invalidate()
+        let timer = Timer(timeInterval: 5, repeats: true) { [weak self] _ in
+            Task { await self?.poll() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
         // A suspended URLSession request must not hold the polling gate forever.
         // Its eventual completion belongs to the old generation and is ignored.
         pollGeneration = UUID()
@@ -1563,7 +1572,7 @@ extension ChatStore {
         var result: [LocalAIMessage] = []
         var bodyLines: [String] = []
         var quote: (index: Int?, snippet: String)?
-        for line in part.components(separatedBy: "\n") {
+        for line in LocalReplyMarkup.lines(part) {
             if let fields = Self.markupFields(line, tag: "拍一拍") {
                 let suffix = fields.first?.trimmingCharacters(in: .whitespaces) ?? ""
                 let target = UserDefaults.standard.string(forKey: "myNickname") ?? "我"
@@ -1788,7 +1797,7 @@ enum MessageBubbleSplitter {
 
     static let localMarkupInstruction = """
     聊天里还可以用这些标记（每个标记单独占一行，不要解释标记）：
-    - 拍一拍对方：[[拍一拍]]，想加后缀写 [[拍一拍|后缀]]，例如 [[拍一拍|的小脑袋]]
+    - 拍一拍对方：单独一行只写 [[拍一拍]]；想加后缀就写 [[拍一拍|后缀]]，例如 [[拍一拍|的肩膀]] 会显示成「你 拍了拍「对方」的肩膀」。用半角竖线 |，后缀只写动作的尾巴，正文另起一行写
     - 引用对方的某条消息再回复：在气泡第一行写 [[引用|那条消息开头的几个字]]，下一行写回复内容
     - 给对方的某条消息贴表情：[[贴表情|🥰|那条消息开头的几个字]]；省略后面的字就贴在对方最新一条消息上
     对方引用你时，消息开头会出现「（引用 某人：原文）」；对方给你贴的表情会写在你那条消息后面的「（对方给这条贴了 …）」里。
@@ -3649,9 +3658,8 @@ private struct LocalAIMessageBubble: View, Equatable {
                 MessageLinkPreviewCard(url: url)
             }
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 9)
-        .modifier(BubbleGlass(shape: RoundedRectangle(cornerRadius: 24, style: .continuous)))
+        .modifier(ChatTextBubblePadding())
+        .modifier(ChatTextBubbleBackground(mine: mine))
     }
 }
 
@@ -4508,6 +4516,7 @@ private struct WorkspaceLauncherView: View {
                 .padding(.top, 44)
             }
             .scrollIndicators(.hidden)
+            .scrollDisabled(true)
 
             VStack {
                 Spacer()
@@ -4909,10 +4918,10 @@ struct ConversationListView: View {
                         onCloseDragChanged: updateWorkspaceCloseDrag,
                         onCloseDragEnded: finishWorkspaceCloseDrag
                     )
+                    .frame(width: geometry.size.width + geometry.safeAreaInsets.leading + geometry.safeAreaInsets.trailing,
+                           height: geometry.size.height + geometry.safeAreaInsets.top + geometry.safeAreaInsets.bottom)
                     .ignoresSafeArea()
-                    .opacity(workspaceRevealProgress)
-                    .scaleEffect(0.96 + (0.04 * workspaceRevealProgress))
-                    .offset(y: -24 * (1 - workspaceRevealProgress))
+                    .transaction { $0.animation = nil }
                     .allowsHitTesting(workspaceOpen)
                     .zIndex(0)
                 }
@@ -6839,6 +6848,33 @@ struct AICrossContextToggle: View {
 
 /// Shorthand markup that device-local AI replies may contain (see localMarkupInstruction).
 private enum LocalReplyMarkup {
+    /// Splits text into lines and moves every pat marker onto its own canonical
+    /// `[[拍一拍]]` / `[[拍一拍|suffix]]` line, even when a model writes it inline,
+    /// with full-width bars or with spaces inside the brackets.
+    static func lines(_ text: String) -> [String] {
+        let pattern = #"\[\[\s*拍一拍\s*(?:[|｜]\s*([^\]]*?))?\s*\]\]"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return text.components(separatedBy: "\n") }
+        var result: [String] = []
+        for line in text.components(separatedBy: "\n") {
+            let ns = line as NSString
+            let matches = regex.matches(in: line, range: NSRange(location: 0, length: ns.length))
+            if matches.isEmpty { result.append(line); continue }
+            var rest = ""
+            var cursor = 0
+            for match in matches {
+                rest += ns.substring(with: NSRange(location: cursor, length: match.range.location - cursor))
+                cursor = match.range.location + match.range.length
+                let suffixRange = match.range(at: 1)
+                let suffix = suffixRange.location == NSNotFound ? ""
+                    : ns.substring(with: suffixRange).trimmingCharacters(in: .whitespaces)
+                result.append(suffix.isEmpty ? "[[拍一拍]]" : "[[拍一拍|\(suffix)]]")
+            }
+            rest += ns.substring(from: cursor)
+            let trimmed = rest.trimmingCharacters(in: .whitespaces)
+            if !trimmed.isEmpty { result.append(trimmed) }
+        }
+        return result
+    }
     enum Item {
         case text(String, quote: String?)
         case pat(String)
@@ -6857,7 +6893,7 @@ private enum LocalReplyMarkup {
         var result: [Item] = []
         var body: [String] = []
         var quote: String?
-        for line in part.components(separatedBy: "\n") {
+        for line in lines(part) {
             if let values = fields(line, tag: "拍一拍") {
                 result.append(.pat(values.first?.trimmingCharacters(in: .whitespaces) ?? ""))
             } else if let values = fields(line, tag: "贴表情"),
@@ -6994,6 +7030,7 @@ extension Notification.Name {
 }
 
 struct AddedAIChatView: View {
+    @Environment(\.scenePhase) private var scenePhase
     private enum ReactionPage {
         case emoji
         case stickers
@@ -7246,6 +7283,12 @@ struct AddedAIChatView: View {
             draftSaveTask?.cancel()
             UserDefaults.standard.set(draftBuffer.text, forKey: "chatDraft.\(current.id)")
         }
+        .onChange(of: scenePhase) { _, phase in
+            // Replies that finished while backgrounded are already persisted; pick them up.
+            if phase == .active && !sending {
+                Task { await loadMessages() }
+            }
+        }
         .onAppear {
             liveness.visible = true
             UserDefaults.standard.set(current.id, forKey: LocalAIInbox.activeKey)
@@ -7487,6 +7530,9 @@ struct AddedAIChatView: View {
         let live = liveness
         let diskKey = storageKey()
         Task {
+            // Keep the model request alive briefly if the app is backgrounded mid-reply.
+            let lease = ChatSendBackgroundLease()
+            defer { lease.end() }
             do {
                 if current.kind == "group" {
                     let allMembers = configuredGroupMembers()
@@ -9191,7 +9237,7 @@ private struct ChatTimeline: View, Equatable {
         var pats: [PatInfo] = []
         var lines: [String] = []
         let target = UserDefaults.standard.string(forKey: "myNickname") ?? "我"
-        for line in text.components(separatedBy: "\n") {
+        for line in LocalReplyMarkup.lines(text) {
             if let values = LocalReplyMarkup.fields(line, tag: "拍一拍") {
                 let suffix = values.first?.trimmingCharacters(in: .whitespaces) ?? ""
                 pats.append(PatInfo(actor: actor, target: target, suffix: suffix.isEmpty ? "" : " \(suffix)"))
@@ -9272,7 +9318,7 @@ private struct ChatTimeline: View, Equatable {
                 MediaGroupInfo.parse(message.text) == nil &&
                 LocationInfo.parse(message.text) == nil &&
                 store.approvePayload(for: message) == nil
-            if canSplit, message.displayedText.contains("[[拍一拍") {
+            if canSplit, message.displayedText.contains("拍一拍") {
                 let extracted = Self.extractPats(message.displayedText, actor: store.localPeer?.displayName ?? "助手")
                 if !extracted.pats.isEmpty {
                     var result = extracted.pats.enumerated().map { offset, pat in
@@ -9907,6 +9953,7 @@ private struct ChatComposerView: View {
 struct ChatView: View {
 
     @ObservedObject var store: ChatStore
+    @Environment(\.scenePhase) private var scenePhase
     @AppStorage(ChatFontChoice.storageKey) private var chatFontRaw = ChatFontChoice.system.rawValue
     @AppStorage(ChatBubbleStyle.storageKey) private var chatBubbleStyleRaw = ChatBubbleStyle.glass.rawValue
     @Binding var isPinned: Bool
@@ -10140,6 +10187,9 @@ struct ChatView: View {
             Button("好") { retractNotice = nil }
         } message: {
             Text(retractNotice ?? "")
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { store.resumeFromBackground() }
         }
         .onAppear {
             store.start()
