@@ -15,6 +15,7 @@ enum AIModelTools {
         var activity = ChatActivity()
         let memoryTools = MemoryEngine.isEligible(conversation) && MemorySettings.enabled(for: conversation.id)
         let memoryBlock = await MemoryEngine.contextBlock(for: messages, conversation: conversation)
+        await recordMemory(memoryBlock, tools: memoryTools, activity: &activity, onActivity: onActivity)
         let catalog = ((try? await fetchCatalog()) ?? []) + LocalAITools.catalog(memory: memoryTools)
         var input: [[String: Any]] = messages.filter { $0.withdrawn != true }.map { message in
             if message.role == "assistant" { return ["role":"assistant", "content":message.text] }
@@ -81,6 +82,22 @@ enum AIModelTools {
         guard room > 0 else { return }
         if !activity.thinking.isEmpty { activity.thinking += "\n\n" }
         activity.thinking += String(text.prefix(room))
+        await onActivity?(activity)
+    }
+
+    /// Shows in the process view what memory went out with this request, so injection can be verified.
+    private static func recordMemory(_ block: String, tools: Bool, activity: inout ChatActivity,
+                                     onActivity: ChatActivityHandler?) async {
+        let cards = block.components(separatedBy: "\n- [").count - 1
+        let longTerm = block.contains("长期记忆（")
+        let detail: String
+        if !tools && block.isEmpty { detail = "相关记忆：这个助手未开启记忆" }
+        else { detail = "相关记忆：长期记忆\(longTerm ? "已带上" : "为空")，记忆卡 \(cards) 张，记忆工具\(tools ? "可用" : "不可用")" }
+        activity.tools.append(ChatToolStep(id: UUID().uuidString, name: "memory_context", status: "completed", elapsedMS: 0, detail: detail))
+        if !block.isEmpty {
+            if !activity.thinking.isEmpty { activity.thinking += "\n\n" }
+            activity.thinking += "【相关记忆】" + String(block.prefix(4000))
+        }
         await onActivity?(activity)
     }
 
@@ -273,6 +290,7 @@ enum AIModelTools {
         let messages = LocalAITools.stamped(windowed)
         let memoryBlock = await MemoryEngine.contextBlock(for: windowed, conversation: conversation)
         if privateChat { MemoryEngine.scheduleExtraction(all: fullHistory, conversation: conversation, apiKey: apiKey) }
+        await recordMemory(memoryBlock, tools: memoryTools, activity: &activity, onActivity: onActivity)
         let format = (conversation.interfaceFormat ?? "").lowercased()
         let catalog: [[String: Any]]
         // Chat remains usable offline from Moments, but we never advertise unavailable tools.
