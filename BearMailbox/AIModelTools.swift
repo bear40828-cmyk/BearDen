@@ -9,8 +9,11 @@ enum AIModelToolError: LocalizedError {
 // owner's authenticated session. A model never receives the Moments cookie or another AI's token.
 enum AIModelTools {
     static func sendResponses(messages: [LocalAIMessage], conversation: AIConversation, accessToken: String, onActivity: ChatActivityHandler? = nil) async throws -> String {
+        LocalAITools.stripStamp(try await sendResponsesCore(messages: LocalAITools.stamped(messages), conversation: conversation, accessToken: accessToken, onActivity: onActivity))
+    }
+    private static func sendResponsesCore(messages: [LocalAIMessage], conversation: AIConversation, accessToken: String, onActivity: ChatActivityHandler? = nil) async throws -> String {
         var activity = ChatActivity()
-        let catalog = (try? await fetchCatalog()) ?? []
+        let catalog = ((try? await fetchCatalog()) ?? []) + LocalAITools.catalog(memory: false)
         var input: [[String: Any]] = messages.filter { $0.withdrawn != true }.map { message in
             if message.role == "assistant" { return ["role":"assistant", "content":message.text] }
             let blocks = userContent(message, format: "openai") as? [[String: Any]] ?? []
@@ -26,7 +29,7 @@ enum AIModelTools {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.httpBody = try JSONSerialization.data(withJSONObject: [
                 "model":conversation.model ?? "", "store":false, "stream":false,
-                "instructions":"你在熊窝里的昵称是\(conversation.name)。只有真正执行工具后才能声称已操作朋友圈、相册、收藏；不可用时明确说明。\n\n\(MessageBubbleSplitter.promptInstruction)",
+                "instructions":LocalAITools.timePreamble + "你在熊窝里的昵称是\(conversation.name)。只有真正执行工具后才能声称已操作朋友圈、相册、收藏；不可用时明确说明。" + LocalAITools.toolHint(memory: false) + "\n\n\(MessageBubbleSplitter.promptInstruction)",
                 "input":input,
                 "tools":catalog.map { ["type":"function", "name":$0["name"] ?? "", "description":$0["description"] ?? "", "parameters":$0["inputSchema"] ?? [:]] }
             ])
@@ -96,6 +99,15 @@ enum AIModelTools {
     }
 
     private static func visibleToolPurpose(_ name: String) -> String {
+        switch name {
+        case "web_search": return "联网搜索"
+        case "web_open": return "打开网页阅读"
+        case "memory_list": return "查看记忆"
+        case "memory_add": return "记下一条记忆"
+        case "memory_update": return "修改记忆卡"
+        case "longterm_update": return "修改长期记忆"
+        default: break
+        }
         let value = name.lowercased()
         if value.contains("album") || value.contains("photo") { return "查看或处理相册图片" }
         if value.contains("memory") || value.contains("engram") { return "读取或更新长期记忆" }
@@ -107,6 +119,7 @@ enum AIModelTools {
     }
 
     private static func execute(_ name: String, _ arguments: [String: Any], _ conversation: AIConversation) async -> [[String: Any]] {
+        if LocalAITools.handles(name) { return await LocalAITools.execute(name, arguments, conversation) }
         do {
             let data = try JSONSerialization.data(withJSONObject: ["conversation_id": conversation.id, "nickname": conversation.name, "name": name, "arguments": arguments])
             guard let base = SharedAlbumsAPI.base else {
@@ -240,17 +253,27 @@ enum AIModelTools {
                      groupID: String? = nil,
                      onActivity: ChatActivityHandler? = nil,
                      onDelta: (@Sendable (String) async -> Void)? = nil) async throws -> String {
+        LocalAITools.stripStamp(try await sendCore(messages: fullHistory, conversation: conversation, apiKey: apiKey,
+                                                   groupID: groupID, onActivity: onActivity, onDelta: onDelta))
+    }
+
+    private static func sendCore(messages fullHistory: [LocalAIMessage], conversation: AIConversation, apiKey: String,
+                                 groupID: String?,
+                                 onActivity: ChatActivityHandler?,
+                                 onDelta: (@Sendable (String) async -> Void)?) async throws -> String {
         var activity = ChatActivity()
         // Memory: only the recent window goes out verbatim; older turns live on as memory cards.
         let usesMemory = groupID == nil
-        let messages = usesMemory ? MemoryEngine.window(fullHistory, conversation: conversation) : fullHistory
-        let memoryBlock = usesMemory ? await MemoryEngine.contextBlock(for: messages, conversation: conversation) : ""
+        let memoryTools = usesMemory && MemoryEngine.isEligible(conversation) && MemorySettings.enabled(for: conversation.id)
+        let windowed = usesMemory ? MemoryEngine.window(fullHistory, conversation: conversation) : fullHistory
+        let messages = LocalAITools.stamped(windowed)
+        let memoryBlock = usesMemory ? await MemoryEngine.contextBlock(for: windowed, conversation: conversation) : ""
         if usesMemory { MemoryEngine.scheduleExtraction(all: fullHistory, conversation: conversation, apiKey: apiKey) }
         let format = (conversation.interfaceFormat ?? "").lowercased()
         let catalog: [[String: Any]]
         // Chat remains usable offline from Moments, but we never advertise unavailable tools.
-        do { catalog = try await fetchCatalog() } catch { catalog = [] }
-        let system = "你在熊窝里的昵称是\(conversation.name)。你只有在真正调用工具并收到结果后才能说已查看、发布、评论或修改；没有工具时请说明需要在熊窝验证共享功能。自然地和用户对话。\n\n\(MessageBubbleSplitter.promptInstruction)" + memoryBlock
+        do { catalog = try await fetchCatalog() + LocalAITools.catalog(memory: memoryTools) } catch { catalog = LocalAITools.catalog(memory: memoryTools) }
+        let system = LocalAITools.timePreamble + "你在熊窝里的昵称是\(conversation.name)。你只有在真正调用工具并收到结果后才能说已查看、发布、评论或修改；没有工具时请说明需要在熊窝验证共享功能。自然地和用户对话。" + LocalAITools.toolHint(memory: memoryTools) + "\n\n\(MessageBubbleSplitter.promptInstruction)" + memoryBlock
         let normalized = (conversation.baseURL ?? "").trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
         guard !apiKey.isEmpty else { throw AIModelToolError.invalidResponse("请先设置 API Key") }
         if format.contains("anthropic") {

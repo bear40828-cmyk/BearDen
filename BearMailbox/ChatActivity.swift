@@ -147,6 +147,12 @@ enum ChatActivityStyle {
         }
     }
     static func displayName(_ name: String) -> String {
+        switch name {
+        case "web_search": return "联网搜索"
+        case "web_open": return "网页阅读"
+        case "memory_list", "memory_add", "memory_update", "longterm_update": return "记忆"
+        default: break
+        }
         let parts = name.components(separatedBy: "__")
         if parts.count >= 3, parts[0] == "mcp" { return parts[1] }
         return name

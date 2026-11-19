@@ -243,6 +243,105 @@ def group_wait_result(request_id, timeout=60.0):
     return None
 
 
+# ---- 联网：搜索（本机 SearXNG）与读网页 ----
+import html as _html, ipaddress as _ip, socket as _socket, urllib.request as _ureq
+from html.parser import HTMLParser as _HP
+
+SEARXNG = os.environ.get("SEARXNG_URL", "http://127.0.0.1:8889")
+_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+
+
+def web_search(q):
+    url = SEARXNG + "/search?" + urllib.parse.urlencode({"q": q, "format": "json"})
+    req = _ureq.Request(url, headers={"User-Agent": _UA, "X-Forwarded-For": "127.0.0.1", "X-Real-IP": "127.0.0.1"})
+    with _ureq.urlopen(req, timeout=15) as r:
+        d = json.loads(r.read())
+    out = []
+    for it in d.get("results", []):
+        if not it.get("url"):
+            continue
+        out.append({"title": (it.get("title") or "").strip(), "url": it["url"],
+                    "snippet": (it.get("content") or "").strip()[:400]})
+        if len(out) >= 8:
+            break
+    return out
+
+
+class _Text(_HP):
+    SKIP = {"script", "style", "noscript", "svg", "head", "template", "iframe", "nav", "footer", "form"}
+    BLOCK = {"p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "section", "article", "pre", "blockquote", "table", "ul", "ol", "dd", "dt"}
+
+    def __init__(s):
+        super().__init__(convert_charrefs=True)
+        s.parts, s.skip, s.title, s.in_title = [], 0, "", False
+
+    def handle_starttag(s, tag, a):
+        if tag == "title":
+            s.in_title = True
+        elif tag in s.SKIP:
+            s.skip += 1
+        elif tag in s.BLOCK:
+            s.parts.append("\n")
+
+    def handle_endtag(s, tag):
+        if tag == "title":
+            s.in_title = False
+        elif tag in s.SKIP:
+            s.skip = max(0, s.skip - 1)
+        elif tag in s.BLOCK:
+            s.parts.append("\n")
+
+    def handle_data(s, d):
+        if s.in_title:
+            s.title += d
+        elif not s.skip:
+            s.parts.append(d)
+
+
+def _public_host(host):
+    try:
+        for fam, _, _, _, sa in _socket.getaddrinfo(host, None):
+            a = _ip.ip_address(sa[0])
+            if a.is_private or a.is_loopback or a.is_link_local or a.is_reserved or a.is_multicast or a.is_unspecified:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def web_fetch(url, limit=8000):
+    p = urllib.parse.urlparse(url)
+    if p.scheme not in ("http", "https") or not p.hostname or not _public_host(p.hostname):
+        raise ValueError("bad url")
+    req = _ureq.Request(url, headers={"User-Agent": _UA, "Accept": "text/html,text/plain;q=0.9,*/*;q=0.5",
+                                      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"})
+    with _ureq.urlopen(req, timeout=10) as r:
+        if not _public_host(urllib.parse.urlparse(r.geturl()).hostname or ""):
+            raise ValueError("bad redirect")
+        raw = r.read(2 * 1024 * 1024 + 1)[: 2 * 1024 * 1024]
+        ctype = r.headers.get("Content-Type", "")
+        cs = r.headers.get_content_charset()
+    if not cs:
+        m = _re.search(rb'charset=["\']?([\w-]+)', raw[:4096], _re.I)
+        cs = m.group(1).decode() if m else "utf-8"
+    try:
+        txt = raw.decode(cs, "replace")
+    except LookupError:
+        txt = raw.decode("utf-8", "replace")
+    if "html" not in ctype and "<html" not in txt[:2000].lower():
+        title, body = "", txt
+    else:
+        h = _Text()
+        try:
+            h.feed(txt)
+        except Exception:
+            pass
+        title, body = _html.unescape(h.title).strip(), "".join(h.parts)
+    lines = [_re.sub(r"[ \t 　]+", " ", l).strip() for l in body.splitlines()]
+    body = _re.sub(r"\n{3,}", "\n\n", "\n".join(l for l in lines if l))
+    return {"title": title, "url": url, "text": body[:limit], "truncated": len(body) > limit}
+
+
 class H(http.server.SimpleHTTPRequestHandler):
     def __init__(s, *a, **k):
         super().__init__(*a, directory=str(ROOT), **k)
@@ -288,6 +387,24 @@ class H(http.server.SimpleHTTPRequestHandler):
 
     def do_GET(s):
         u = urllib.parse.urlparse(s.path)
+        if u.path in ("/api/search", "/api/fetch"):
+            if not s._authed():
+                return s._json(401, {"error": "pass"})
+            qs = urllib.parse.parse_qs(u.query)
+            try:
+                if u.path == "/api/search":
+                    q = (qs.get("q", [""])[0] or "").strip()
+                    if not q:
+                        return s._json(400, {"error": "q"})
+                    return s._json(200, {"query": q, "results": web_search(q)})
+                url = (qs.get("url", [""])[0] or "").strip()
+                if not url:
+                    return s._json(400, {"error": "url"})
+                return s._json(200, web_fetch(url))
+            except ValueError as e:
+                return s._json(400, {"error": str(e)})
+            except Exception as e:
+                return s._json(502, {"error": type(e).__name__ + ": " + str(e)[:200]})
         if u.path == "/api/memory":
             # 记忆卡片：手机端整份上传，这里原样存一份供服务端读取
             if not s._authed():

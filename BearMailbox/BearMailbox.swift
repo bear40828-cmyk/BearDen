@@ -3382,7 +3382,7 @@ private enum LocalAIInbox {
     }
 }
 
-private enum AIKeychain {
+enum AIKeychain {
     // Keychain service follows the bundle identifier so differently-identified builds keep separate stores.
     private static let service = (Bundle.main.bundleIdentifier ?? "app.bearden.mailbox") + ".ai"
 
@@ -8586,7 +8586,7 @@ private struct ConfiguredAIChatDetailsView: View {
 
                             if MemoryEngine.isEligible(conversation) {
                                 NavigationLink { MemorySpaceView(assistantID: conversation.id) } label: {
-                                    Label("它的记忆", systemImage: "brain")
+                                    Label("它的记忆", systemImage: "heart.text.square")
                                         .font(.system(size: 14, weight: .medium))
                                         .padding(.horizontal, 16).padding(.vertical, 7)
                                         .modifier(Glass(shape: Capsule()))
@@ -11849,7 +11849,7 @@ struct MeView: View {
                             .buttonStyle(.plain)
                             Divider().opacity(0.24)
                             NavigationLink { MemorySpaceView() } label: {
-                                profileMenuRow("记忆空间", systemImage: "brain")
+                                profileMenuRow("记忆空间", systemImage: "heart.text.square")
                             }
                             .buttonStyle(.plain)
 
