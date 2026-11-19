@@ -1968,15 +1968,14 @@ private struct MessageLinkPreviewCard: View {
 struct Bubble: View {
     let msg: Msg
     let reactions: [String]
-    let showsActions: Bool
     var onImage: (URL) -> Void
     var onReply: () -> Void
     var onReact: (String) -> Void
     var onMoreReactions: () -> Void
     var onRetract: () -> Void
     var onDelete: () -> Void
-    /// Long press; passes the bubble's global frame captured at press time.
-    var onLongPress: (CGRect) -> Void
+    /// 「选择文字」: enters system text selection for the given selection key.
+    var onSelectText: (String) -> Void
     var onJumpToReply: (Int) -> Void
     var onAvatarDoubleTap: () -> Void
     var mine: Bool { msg.from == "me" }
@@ -1991,18 +1990,24 @@ struct Bubble: View {
     var activity: ChatActivity? = nil
     var canRetract = false
     @State var openingFile = false
-    @State private var frameBox = BubbleFrameBox()
     @Environment(\.chatPeerConversation) private var peer
 
-    private func press() { onLongPress(frameBox.liveFrame) }
+    private var selectionKey: String { "remote:\(msg.id)" }
 
-    /// Menu trigger from a double tap; prefers the tracked bubble frame when it
-    /// covers the tapped spot, otherwise the rect reported at gesture time.
-    private func activate(_ rect: CGRect) {
-        // Always anchor to the bubble's own frame; the tap point is only a last resort
-        // when the bubble has not been laid out yet.
-        let box = frameBox.liveFrame
-        onLongPress(box.isEmpty ? rect.insetBy(dx: -14, dy: -9) : box)
+    /// Native long-press menu shared by text and media content of this message.
+    private var messageMenu: MessageContextMenu {
+        MessageContextMenu(
+            copyText: msg.displayedText,
+            selectionKey: selectionKey,
+            reactionChoices: MessageReactionChoices.all,
+            onReply: onReply,
+            onReact: onReact,
+            onMoreReactions: onMoreReactions,
+            onSelectText: onSelectText,
+            onFavorite: { try await FavoriteStore.shared.add(message: msg, peerName: peer?.displayName) },
+            onRetract: canRetract ? onRetract : nil,
+            onDelete: onDelete
+        )
     }
 
     var body: some View {
@@ -2019,7 +2024,7 @@ struct Bubble: View {
                     ChatActivityControls(activity: activity, conversationID: peer?.id ?? "claude")
                 }
                 content
-                    .contentShape(Rectangle())
+                    .modifier(messageMenu)
 
                 if !reactions.isEmpty {
                     HStack(spacing: 3) {
@@ -2038,7 +2043,6 @@ struct Bubble: View {
                     .foregroundStyle(.secondary.opacity(0.78))
                     .padding(.horizontal, 4)
             }
-            .modifier(BubbleFrameReporter(messageID: msg.id, box: frameBox, showsActions: showsActions))
 
             if mine {
                 Avatar(isMe: true)
@@ -2046,18 +2050,15 @@ struct Bubble: View {
                 Spacer(minLength: 48)
             }
         }
-        .zIndex(showsActions ? 10 : 0)
     }
 
     @ViewBuilder
     private var content: some View {
         if let location = LocationInfo.parse(msg.text) {
             LocationMessageCard(info: location)
-                .onLongPressGesture(minimumDuration: 0.34, perform: press)
         } else if let f = msg.file, API.isImage(f) {
             VStack(alignment: mine ? .trailing : .leading, spacing: 6) {
                 ChatImageView(name: f, onOpen: { onImage(API.fileURL(f)) })
-                    .onLongPressGesture(minimumDuration: 0.34, perform: press)
                 if reply != nil || !msg.displayedText.isEmpty {
                     textBubble(text: msg.displayedText, showsReply: true)
                 }
@@ -2066,13 +2067,11 @@ struct Bubble: View {
             VStack(alignment: mine ? .trailing : .leading, spacing: 6) {
                 if reply != nil { textBubble(text: msg.displayedText, showsReply: true) }
                 VoiceMessagePlayer(url: API.fileURL(f))
-                    .onLongPressGesture(minimumDuration: 0.34, perform: press)
             }
         } else if let f = msg.file, API.isVideo(f) {
             VStack(alignment: mine ? .trailing : .leading, spacing: 6) {
                 if reply != nil { textBubble(text: msg.displayedText, showsReply: true) }
                 VideoThumbnailBubble(name: f) { openingFile = true }
-                    .onLongPressGesture(minimumDuration: 0.34, perform: press)
                     .fullScreenCover(isPresented: $openingFile) {
                         VideoMessageViewer(name: f, onFavorite: { try await FavoriteStore.shared.add(message: msg, peerName: peer?.displayName) })
                     }
@@ -2088,7 +2087,6 @@ struct Bubble: View {
                         .modifier(BubbleGlass(shape: RoundedRectangle(cornerRadius: 26, style: .continuous)))
                 }
                 .buttonStyle(.plain)
-                .onLongPressGesture(minimumDuration: 0.34, perform: press)
                 .fullScreenCover(isPresented: $openingFile) {
                     FileMessageViewer(name: f, onFavorite: { try await FavoriteStore.shared.add(message: msg, peerName: peer?.displayName) })
                 }
@@ -2130,7 +2128,7 @@ struct Bubble: View {
             }
 
             if !text.isEmpty {
-                SelectableMarkdownText(text: text, onActivate: activate, selectionKey: "remote:\(msg.id)")
+                SelectableMarkdownText(text: text, selectionKey: selectionKey)
             }
 
             if let url = MessageURLDetector.firstWebURL(in: text) {
@@ -2140,12 +2138,6 @@ struct Bubble: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
         .modifier(ChatTextBubbleBackground(mine: mine))
-        .contentShape(Rectangle())
-        .simultaneousGesture(
-            SpatialTapGesture(count: 2, coordinateSpace: .global).onEnded { value in
-                activate(CGRect(origin: value.location, size: .zero).insetBy(dx: -1, dy: -1))
-            }
-        )
     }
 }
 
@@ -2191,119 +2183,146 @@ private struct LocationMessageCard: View {
     }
 }
 
-private struct MessageActionBar: View {
+/// Reaction emoji offered in a message's 「贴表情」 submenu.
+enum MessageReactionChoices {
+    static let all = [
+        "😀", "😄", "😁", "😂", "🤣", "😊", "🥰",
+        "😍", "😘", "😋", "😎", "🤩", "🥳", "😏",
+        "🥺", "😭", "😤", "😡", "🤯", "😴", "🤔",
+        "🙄", "😶", "🫠", "🤡", "👀", "👍", "🫶",
+        "❤️", "💗", "✨", "🎉", "🔥", "🌚", "🫪"
+    ]
+}
+
+/// System long-press context menu for a message bubble (lifted preview + action list).
+private struct MessageContextMenu: ViewModifier {
+    let copyText: String
+    let selectionKey: String
+    let reactionChoices: [String]
+    var cornerRadius: CGFloat = 22
     let onReply: () -> Void
     let onReact: (String) -> Void
-    let onMore: () -> Void
-    /// 点“选择”进系统选字；为 nil 时不显示该按钮。
-    var onSelectText: (() -> Void)? = nil
-    /// 复制成功后关闭预览；为 nil 时不处理（cell 内菜单沿用旧行为）。
-    var onDismiss: (() -> Void)? = nil
-    /// 为 true 时菜单位置由宿主定，内部不再自己算偏移。
-    var externalPositioning = false
-    /// 菜单实际高度变化时回调，宿主用来定位。
-    var onHeightChange: ((CGFloat) -> Void)? = nil
-    var onRetract: () -> Void = {}
-    var onDelete: (() -> Void)? = nil
-    var copyText: String = ""
-    /// 是否显示「撤回」。
-    var mine = false
-    var selectionKey: String = ""
+    var onMoreReactions: (() -> Void)? = nil
+    var onSelectText: ((String) -> Void)? = nil
     var onFavorite: (() async throws -> Void)? = nil
-    @State private var saving = false
-    @State private var saved = false
-    @State private var errorMessage: String?
-    @State private var selectionShift: CGFloat = 0
+    var onRetract: (() -> Void)? = nil
+    var onDelete: (() -> Void)? = nil
+
+    @State private var translating = false
+    @State private var translationText = ""
+    @State private var favoriteError: String?
     @State private var confirmingDelete = false
 
-    // 部分选中时把菜单挪到选区上方；上方空间不足时放到选区下方。
-    private func updateSelectionShift(frame: CGRect) {
-        let base = frame.minY - selectionShift
-        guard let rect = ChatTextSelection.partialSelectionRect(key: selectionKey) else {
-            selectionShift = 0
-            return
-        }
-        let topLimit: CGFloat = 100
-        var top = rect.minY - frame.height - 10
-        if top < topLimit { top = rect.maxY + 10 }
-        selectionShift = top - base
+    private var plainText: String { uiMarkdown(copyText, size: 16).string }
+
+    /// Runs after the menu's dismissal animation so presented sheets and selection
+    /// do not collide with the closing preview.
+    private func afterMenuCloses(_ work: @escaping () -> Void) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: work)
     }
 
-    var body: some View {
-        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 0), count: 4), spacing: 8) {
-            if !copyText.isEmpty {
-                action("复制", "doc.on.doc") {
-                    ChatTextSelection.copy(key: selectionKey, fallback: copyText)
-                    UINotificationFeedbackGenerator().notificationOccurred(.success)
-                    NotificationCenter.default.post(name: .clearChatTextSelection, object: nil)
-                    onDismiss?()
-                }
-                action("全选", "text.badge.checkmark") { ChatTextSelection.selectAll(key: selectionKey) }
-                if let onSelectText {
-                    action("选择", "text.cursor", perform: onSelectText)
-                }
-            }
-            action("引用", "arrowshape.turn.up.left", perform: onReply)
-            if let onFavorite {
-                action(saved ? "已收藏" : (saving ? "保存中" : "收藏"), saved ? "star.fill" : "star") {
-                    guard !saving else { return }
-                    saving = true
-                    Task {
-                        defer { saving = false }
-                        do { try await onFavorite(); saved = true }
-                        catch { errorMessage = error.localizedDescription }
-                    }
-                }
-            }
-            action("表情", "face.smiling", perform: onMore)
-            if !copyText.isEmpty {
-                ChatTranslateButton { ChatTextSelection.selectedText(key: selectionKey, fallback: copyText) }
-            }
-            if mine {
-                action("撤回", "arrow.uturn.backward", perform: onRetract)
-            }
-            if onDelete != nil {
-                action("删除", "trash") { confirmingDelete = true }
-            }
-        }
-        .padding(10)
-        .frame(width: 258)
-        .modifier(BubbleGlass(shape: RoundedRectangle(cornerRadius: 22)))
-        .modifier(ChatMenuHitRegion())
-        .background {
-            GeometryReader { proxy in
-                Color.clear
-                    .onAppear {
-                        onHeightChange?(proxy.size.height)
-                        if !externalPositioning { updateSelectionShift(frame: proxy.frame(in: .global)) }
-                    }
-                    .onChange(of: proxy.size.height) { _, height in onHeightChange?(height) }
-                    .onReceive(NotificationCenter.default.publisher(for: .chatTextSelectionChanged)) { _ in
-                        if !externalPositioning { updateSelectionShift(frame: proxy.frame(in: .global)) }
-                    }
-            }
-        }
-        .offset(y: externalPositioning ? 0 : selectionShift)
-        .animation(.easeOut(duration: 0.15), value: selectionShift)
-        .buttonStyle(.plain)
-        .alert("收藏未成功", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
-            Button("好") { errorMessage = nil }
-        } message: { Text(errorMessage ?? "") }
-        .alert("删除这条消息？", isPresented: $confirmingDelete) {
-            Button("删除", role: .destructive) { onDelete?() }
-            Button("取消", role: .cancel) {}
-        } message: { Text("只从本机删除，不影响对方。") }
+    func body(content: Content) -> some View {
+        content
+            .contentShape(.contextMenuPreview, RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            .contextMenu { menuItems }
+            .modifier(MessageTranslationHost(isPresented: $translating, text: translationText))
+            .alert("收藏未成功", isPresented: Binding(get: { favoriteError != nil }, set: { if !$0 { favoriteError = nil } })) {
+                Button("好") { favoriteError = nil }
+            } message: { Text(favoriteError ?? "") }
+            .alert("删除这条消息？", isPresented: $confirmingDelete) {
+                Button("删除", role: .destructive) { onDelete?() }
+                Button("取消", role: .cancel) {}
+            } message: { Text("只从本机删除，不影响对方。") }
     }
 
-    private func action(_ title: String, _ symbol: String, perform: @escaping () -> Void) -> some View {
-        Button(action: perform) {
-            VStack(spacing: 4) {
-                Image(systemName: symbol).font(.system(size: 17, weight: .medium))
-                Text(title).font(.system(size: 10))
+    @ViewBuilder
+    private var menuItems: some View {
+        Button(action: onReply) {
+            Label("回复", systemImage: "arrowshape.turn.up.left")
+        }
+        if !copyText.isEmpty {
+            Button {
+                UIPasteboard.general.string = plainText
+                UINotificationFeedbackGenerator().notificationOccurred(.success)
+            } label: {
+                Label("复制", systemImage: "doc.on.doc")
             }
-            .frame(maxWidth: .infinity).frame(height: 40)
-            .contentShape(Rectangle())
-        }.accessibilityLabel(title)
+            if let onSelectText {
+                Button {
+                    let key = selectionKey
+                    afterMenuCloses { onSelectText(key) }
+                } label: {
+                    Label("选择文字", systemImage: "selection.pin.in.out")
+                }
+            }
+        }
+        if let onFavorite {
+            Button {
+                Task {
+                    do {
+                        try await onFavorite()
+                        UINotificationFeedbackGenerator().notificationOccurred(.success)
+                    } catch {
+                        favoriteError = error.localizedDescription
+                    }
+                }
+            } label: {
+                Label("收藏", systemImage: "star")
+            }
+        }
+        if !copyText.isEmpty, MessageTranslationHost.isAvailable {
+            Button {
+                translationText = plainText
+                afterMenuCloses { translating = true }
+            } label: {
+                Label("翻译", systemImage: "translate")
+            }
+        }
+        Menu {
+            ForEach(reactionChoices, id: \.self) { emoji in
+                Button(emoji) { onReact(emoji) }
+            }
+            if let onMoreReactions {
+                Button {
+                    afterMenuCloses(onMoreReactions)
+                } label: {
+                    Label("更多表情", systemImage: "ellipsis")
+                }
+            }
+        } label: {
+            Label("贴表情", systemImage: "face.smiling")
+        }
+        if let onRetract {
+            Button(action: onRetract) {
+                Label("撤回", systemImage: "arrow.uturn.backward")
+            }
+        }
+        if onDelete != nil {
+            Button(role: .destructive) {
+                afterMenuCloses { confirmingDelete = true }
+            } label: {
+                Label("删除", systemImage: "trash")
+            }
+        }
+    }
+}
+
+/// Hosts the system translation sheet where the OS supports it.
+private struct MessageTranslationHost: ViewModifier {
+    @Binding var isPresented: Bool
+    let text: String
+
+    static var isAvailable: Bool {
+        if #available(iOS 17.4, *) { return true }
+        return false
+    }
+
+    func body(content: Content) -> some View {
+        if #available(iOS 17.4, *) {
+            content.translationPresentation(isPresented: $isPresented, text: text)
+        } else {
+            content
+        }
     }
 }
 
@@ -2348,107 +2367,59 @@ private extension Notification.Name {
 @MainActor
 private enum ChatTextSelection {
     static weak var active: ChatSelectionTextView?
-    static var menuFrames: [UUID: CGRect] = [:]
-    /// 气泡的全局 frame：点空白处时判断点在哪个气泡上，由气泡上报。
-    static var messageFrames: [Int: CGRect] = [:]
-    /// 系统选字模式：为 true 时放开系统编辑菜单，自定义长按短路。
+    /// System selection mode: the text view is selectable and shows the system edit menu.
     static var systemSelecting = false
-    /// 点按落点（气泡内坐标），“选择”时用来取词。
-    static var tapPoint: CGPoint?
+    /// Live text views by selection key, so a menu action can target its own message.
+    private static let views = NSMapTable<NSString, ChatSelectionTextView>.strongToWeakObjects()
+
+    static func register(_ view: ChatSelectionTextView, key: String) {
+        guard !key.isEmpty else { return }
+        views.setObject(view, forKey: key as NSString)
+    }
+
     static func isSelectionInteraction(at point: CGPoint) -> Bool {
-        if menuFrames.values.contains(where: { $0.contains(point) }) { return true }
         guard let active, active.selectedRange.length > 0 else { return false }
         return active.convert(active.bounds, to: nil).insetBy(dx: -18, dy: -18).contains(point)
     }
-    static func selectedText(key: String, fallback: String) -> String {
-        if let view = active, view.selectionKey == key,
-           let range = view.selectedTextRange, !range.isEmpty {
-            return view.text(in: range) ?? ""
-        }
-        return uiMarkdown(fallback, size: 16).string
-    }
-    static func copy(key: String, fallback: String) {
-        UIPasteboard.general.string = selectedText(key: key, fallback: fallback)
-    }
-    /// 部分选中时返回选区在窗口坐标中的外接矩形；未选中或全选时返回 nil。
-    static func partialSelectionRect(key: String) -> CGRect? {
-        guard let view = active, view.selectionKey == key, view.window != nil,
-              let range = view.selectedTextRange, !range.isEmpty,
-              view.selectedRange.length < view.attributedText.length else { return nil }
-        let rects = view.selectionRects(for: range).map(\.rect).filter { !$0.isEmpty && $0.width > 0 }
-        guard let first = rects.first else { return nil }
-        let union = rects.dropFirst().reduce(first) { $0.union($1) }
-        return view.convert(union, to: nil)
-    }
-    static func selectAll(key: String) {
-        guard let view = active, view.selectionKey == key else { return }
+
+    /// Makes the message's text selectable, selects all of it and shows the system handles.
+    @discardableResult
+    static func beginSystemSelection(key: String) -> Bool {
+        guard let view = views.object(forKey: key as NSString), view.window != nil else { return false }
+        if let old = active, old !== view { endSystemSelection() }
+        systemSelecting = true
+        active = view
+        view.isSelectable = true
         view.becomeFirstResponder()
         view.selectedRange = NSRange(location: 0, length: view.attributedText.length)
+        return true
     }
-}
 
-private struct ChatMenuHitRegion: ViewModifier {
-    @State private var id = UUID()
-    func body(content: Content) -> some View {
-        content.background {
-            GeometryReader { proxy in
-                Color.clear
-                    .onAppear { ChatTextSelection.menuFrames[id] = proxy.frame(in: .global) }
-                    .onChange(of: proxy.frame(in: .global)) { _, frame in ChatTextSelection.menuFrames[id] = frame }
-                    .onDisappear { ChatTextSelection.menuFrames.removeValue(forKey: id) }
-            }
+    static func endSystemSelection() {
+        systemSelecting = false
+        if let view = active {
+            view.selectedRange = NSRange(location: 0, length: 0)
+            view.resignFirstResponder()
+            view.isSelectable = false
         }
-    }
-}
-
-private struct ChatTranslateButton: View {
-    let text: () -> String
-    @State private var presented = false
-    @State private var value = ""
-    var body: some View {
-        if #available(iOS 17.4, *) {
-            Button {
-                value = text()
-                presented = !value.isEmpty
-            } label: {
-                VStack(spacing: 4) {
-                    Image(systemName: "translate").font(.system(size: 17, weight: .medium))
-                    Text("翻译").font(.system(size: 10))
-                }.frame(maxWidth: .infinity).frame(height: 40).contentShape(Rectangle())
-            }
-            .accessibilityLabel("翻译")
-            .translationPresentation(isPresented: $presented, text: value)
-        }
+        active = nil
     }
 }
 
 private final class ChatSelectionTextView: UITextView {
     var selectionKey = ""
-    /// Custom double tap that opens the message menu; the built-in word-selection
-    /// double tap waits for it to fail so the two never both fire.
-    weak var menuDoubleTap: UITapGestureRecognizer?
 
-    override func didMoveToWindow() {
-        super.didMoveToWindow()
-        guard window != nil, let menuDoubleTap else { return }
-        for recognizer in gestureRecognizers ?? [] where recognizer !== menuDoubleTap {
-            if let tap = recognizer as? UITapGestureRecognizer, tap.numberOfTapsRequired == 2 {
-                tap.require(toFail: menuDoubleTap)
-            }
-        }
-    }
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
-        // 只在系统选字模式放开系统菜单；平时仍走自定义操作栏。
+        // Only system selection mode shows the system edit menu.
         guard ChatTextSelection.systemSelecting else { return false }
         return super.canPerformAction(action, withSender: sender)
     }
 }
 
-// Double tap on the text opens the message menu; single taps (links) stay with UIKit.
+// Message text. Not selectable by default so a long press opens the message's context
+// menu; 「选择文字」 switches it into system selection.
 private struct SelectableMarkdownText: UIViewRepresentable {
     let text: String
-    /// Called on double tap with the text view's frame in window coordinates.
-    let onActivate: (CGRect) -> Void
     var selectionKey: String = ""
 
     /// Observed directly so a font change re-renders every visible bubble at once,
@@ -2458,7 +2429,7 @@ private struct SelectableMarkdownText: UIViewRepresentable {
 
     private var renderKey: String { fontChoice.rawValue + "|" + text }
 
-    final class Coordinator: NSObject, UIGestureRecognizerDelegate, UITextViewDelegate {
+    final class Coordinator: NSObject, UITextViewDelegate {
         var parent: SelectableMarkdownText
         var renderedSource: String
         weak var textView: UITextView?
@@ -2479,54 +2450,23 @@ private struct SelectableMarkdownText: UIViewRepresentable {
 
         @objc private func clearSelection() {
             guard let textView else { return }
-            textView.selectedRange = NSRange(location: 0, length: 0)
-            textView.resignFirstResponder()
-        }
-
-        @objc func doubleTapped(_ recognizer: UITapGestureRecognizer) {
-            guard recognizer.state == .ended else { return }
-            guard !ChatTextSelection.systemSelecting else { return }
-            if let view = textView {
-                ChatTextSelection.tapPoint = recognizer.location(in: view)
+            if ChatTextSelection.active === textView {
+                ChatTextSelection.endSystemSelection()
+            } else {
+                textView.selectedRange = NSRange(location: 0, length: 0)
+                textView.resignFirstResponder()
+                textView.isSelectable = false
             }
-            if let view = textView as? ChatSelectionTextView {
-                if let old = ChatTextSelection.active, old !== view {
-                    old.selectedRange = NSRange(location: 0, length: 0)
-                    old.resignFirstResponder()
-                }
-                ChatTextSelection.active = view
-            }
-            let rect = textView.map { $0.convert($0.bounds, to: nil) } ?? .zero
-            parent.onActivate(rect)
-            // Drop any word selection a system recognizer may have made on the same taps.
-            DispatchQueue.main.async { [weak self] in
-                guard let view = self?.textView, !ChatTextSelection.systemSelecting else { return }
-                if view.selectedRange.length > 0 { view.selectedRange = NSRange(location: 0, length: 0) }
-            }
-        }
-
-        func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
-            // In system selection mode double taps belong to UIKit's word selection.
-            if gestureRecognizer is UITapGestureRecognizer { return !ChatTextSelection.systemSelecting }
-            return true
         }
 
         func textViewDidChangeSelection(_ textView: UITextView) {
-            if textView.selectedRange.length > 0, let view = textView as? ChatSelectionTextView {
-                ChatTextSelection.active = view
-            }
             NotificationCenter.default.post(name: .chatTextSelectionChanged, object: nil)
         }
 
         func textView(_ textView: UITextView, editMenuForTextIn range: NSRange, suggestedActions: [UIMenuElement]) -> UIMenu? {
-            // 系统选字模式走系统默认菜单（拷贝/全选/查询/翻译…）；平时禁掉，走自定义操作栏。
+            // System selection mode uses the default system menu (copy, look up, translate...).
             ChatTextSelection.systemSelecting ? nil : UIMenu(children: [])
         }
-
-        func gestureRecognizer(
-            _ gestureRecognizer: UIGestureRecognizer,
-            shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
-        ) -> Bool { true }
     }
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
@@ -2536,7 +2476,7 @@ private struct SelectableMarkdownText: UIViewRepresentable {
         v.selectionKey = selectionKey
         v.delegate = context.coordinator
         v.isEditable = false
-        v.isSelectable = true
+        v.isSelectable = false
         v.isScrollEnabled = false
         v.backgroundColor = .clear
         v.textContainerInset = .zero
@@ -2544,20 +2484,17 @@ private struct SelectableMarkdownText: UIViewRepresentable {
         v.adjustsFontForContentSizeCategory = true
         v.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         v.attributedText = uiMarkdown(text, size: 16, font: fontChoice)
-        let doubleTap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.doubleTapped(_:)))
-        doubleTap.numberOfTapsRequired = 2
-        doubleTap.cancelsTouchesInView = false
-        doubleTap.delaysTouchesEnded = false
-        doubleTap.delegate = context.coordinator
-        v.addGestureRecognizer(doubleTap)
-        v.menuDoubleTap = doubleTap
         context.coordinator.textView = v
+        ChatTextSelection.register(v, key: selectionKey)
         return v
     }
 
     func updateUIView(_ v: UITextView, context: Context) {
         context.coordinator.parent = self
-        (v as? ChatSelectionTextView)?.selectionKey = selectionKey
+        if let view = v as? ChatSelectionTextView {
+            view.selectionKey = selectionKey
+            ChatTextSelection.register(view, key: selectionKey)
+        }
         if context.coordinator.renderedSource != renderKey {
             context.coordinator.renderedSource = renderKey
             v.attributedText = uiMarkdown(text, size: 16, font: fontChoice)
@@ -3549,14 +3486,13 @@ private struct LocalAIMessageBubble: View, Equatable {
     let message: LocalAIMessage
     let conversation: AIConversation
     var onReply: () -> Void = {}
+    var onReact: (String) -> Void = { _ in }
     var onMore: () -> Void = {}
     var onRetract: () -> Void = {}
     var onJump: (UUID) -> Void = { _ in }
     var onPat: () -> Void = {}
     var onImage: (URL) -> Void = { _ in }
-    @State private var showsActions = false
-    @State private var favoriteError: String?
-    @State private var favoriteSaved = false
+    var reactionChoices: [String] = MessageReactionChoices.all
 
     private var mine: Bool { message.role == "user" }
     private var senderConversation: AIConversation {
@@ -3597,14 +3533,15 @@ private struct LocalAIMessageBubble: View, Equatable {
                         StickerThumbnail(url: stickerURL)
                             .frame(width: 150, height: 150)
                             .onTapGesture { onImage(stickerURL) }
-                            .onLongPressGesture { showsActions = true }
+                            .modifier(messageMenu)
                     } else {
                         messageBubble
+                            .modifier(messageMenu)
                     }
                 }
                 if message.withdrawn != true, let files = message.attachments, !files.isEmpty {
                     LocalChatAttachmentsView(files: files, onImage: onImage)
-                        .onLongPressGesture { showsActions = true }
+                        .modifier(messageMenu)
                 }
                 let reactions = (message.reactions ?? []) + (message.aiReaction.map { [$0] } ?? [])
                 if !reactions.isEmpty {
@@ -3618,20 +3555,6 @@ private struct LocalAIMessageBubble: View, Equatable {
                     .foregroundStyle(.secondary.opacity(0.78))
                     .padding(.horizontal, 4)
             }
-            .overlay(alignment: mine ? .topTrailing : .topLeading) {
-                if showsActions && message.withdrawn != true {
-                    MessageActionBar(
-                        onReply: onReply, onReact: { _ in }, onMore: onMore,
-                        onRetract: onRetract, copyText: message.text,
-                        mine: mine, selectionKey: "local:\(message.id)",
-                        onFavorite: {
-                            let urls = (message.attachments ?? []).map(\.url) + (message.stickerURL.map { [$0] } ?? [])
-                            try await FavoriteStore.shared.add(sourceKey: "local:\(conversation.id):\(message.id)", remark: mine ? FavoriteStore.remark(mine: true) : senderConversation.displayName, text: message.text, urls: urls)
-                        }
-                    ).foregroundStyle(.primary).offset(y: -116)
-                        .transition(.scale(scale: 0.88).combined(with: .opacity)).zIndex(20)
-                }
-            }
 
             if mine {
                 MyAvatar(size: 36)
@@ -3640,9 +3563,23 @@ private struct LocalAIMessageBubble: View, Equatable {
             }
         }
         .transition(.move(edge: .bottom).combined(with: .opacity))
-        .zIndex(showsActions ? 10 : 0)
-        .onReceive(NotificationCenter.default.publisher(for: .clearChatTextSelection)) { _ in showsActions = false }
-        .alert("收藏未成功", isPresented: Binding(get: { favoriteError != nil }, set: { if !$0 { favoriteError = nil } })) { Button("好") { favoriteError = nil } } message: { Text(favoriteError ?? "") }
+    }
+
+    private var messageMenu: MessageContextMenu {
+        MessageContextMenu(
+            copyText: message.text,
+            selectionKey: "local:\(message.id)",
+            reactionChoices: reactionChoices,
+            onReply: onReply,
+            onReact: onReact,
+            onMoreReactions: onMore,
+            onSelectText: { ChatTextSelection.beginSystemSelection(key: $0) },
+            onFavorite: {
+                let urls = (message.attachments ?? []).map(\.url) + (message.stickerURL.map { [$0] } ?? [])
+                try await FavoriteStore.shared.add(sourceKey: "local:\(conversation.id):\(message.id)", remark: mine ? FavoriteStore.remark(mine: true) : senderConversation.displayName, text: message.text, urls: urls)
+            },
+            onRetract: mine ? onRetract : nil
+        )
     }
 
     private var messageBubble: some View {
@@ -3658,7 +3595,7 @@ private struct LocalAIMessageBubble: View, Equatable {
                     }
                 }.buttonStyle(.plain)
             }
-            SelectableMarkdownText(text: message.text, onActivate: { _ in showsActions = true }, selectionKey: "local:\(message.id)")
+            SelectableMarkdownText(text: message.text, selectionKey: "local:\(message.id)")
             if let url = MessageURLDetector.firstWebURL(in: message.text) {
                 MessageLinkPreviewCard(url: url)
             }
@@ -4392,74 +4329,34 @@ private struct WorkspaceWebsiteIcon: View {
     }
 }
 
-/// Reports how far a scroll view is pulled past one edge, but only for a drag that began
-/// with the content already resting at that edge. Scrolling into the edge (momentum, or the
-/// same finger still moving) never counts, so the list behaves normally until the user stops
-/// at the edge and then deliberately pulls further.
-private struct ScrollEdgePullTracker: ViewModifier {
-    enum Edge { case top, bottom }
-    let edge: Edge
-    let enabled: Bool
-    let onPull: (CGFloat) -> Void
-    let onRelease: (CGFloat) -> Void
+/// Records the scroll phase at the moment a finger lands on a scroll view, so a drag gesture
+/// can tell a deliberate pull from rest apart from a scroll that only just reached the edge.
+private final class ScrollTouchState {
+    /// True while a finger is down and the scroll view is tracking it.
+    var touching = false
+    /// Whether the current touch landed while the content was idle (not mid-momentum).
+    var beganAtRest = false
+    var touchBeganAt = Date.distantPast
+    fileprivate var settled = true
+}
 
-    /// Plain reference storage: scroll samples must not invalidate any view.
-    private final class Track {
-        var eligible = false
-        var interacting = false
-        var overscroll: CGFloat = 0
-        /// Edge overscroll sampled while no finger was down and the content was settled.
-        var restOverscroll: CGFloat = 0
-        var settled = true
-    }
-    @State private var track = Track()
-
-    @available(iOS 18.0, *)
-    private func edgeOverscroll(_ g: ScrollGeometry) -> CGFloat {
-        switch edge {
-        case .top:
-            return -(g.contentOffset.y + g.contentInsets.top)
-        case .bottom:
-            let maxOffset = max(g.contentSize.height + g.contentInsets.top + g.contentInsets.bottom - g.containerSize.height, 0)
-            return g.contentOffset.y + g.contentInsets.top - maxOffset
-        }
-    }
+private struct ScrollTouchTracker: ViewModifier {
+    let state: ScrollTouchState
 
     func body(content: Content) -> some View {
         if #available(iOS 18.0, *) {
-            content
-                .onScrollPhaseChange { old, new, context in
-                    if new == .tracking || new == .interacting {
-                        // A touch goes idle -> tracking -> interacting; checking only for
-                        // `.interacting` saw `old == .tracking` and never qualified.
-                        // Eligibility is decided once, when the touch lands: the content
-                        // must be resting (idle, not mid-momentum) at the edge. Scrolling
-                        // into the edge never qualifies.
-                        if !track.interacting {
-                            track.interacting = true
-                            // The geometry in `context` may already include the first few points
-                            // of the drag, so the resting position recorded before the touch is
-                            // what decides eligibility.
-                            track.eligible = enabled && old == .idle && track.settled && abs(track.restOverscroll) <= 2
-                            track.overscroll = 0
-                        }
-                    } else {
-                        if track.interacting {
-                            track.interacting = false
-                            if track.eligible { onRelease(track.overscroll) }
-                            track.eligible = false
-                        }
-                        track.settled = new == .idle
+            content.onScrollPhaseChange { old, new in
+                if new == .tracking || new == .interacting {
+                    if !state.touching {
+                        state.touching = true
+                        state.touchBeganAt = Date()
+                        state.beganAtRest = old == .idle && state.settled
                     }
+                } else {
+                    state.touching = false
+                    state.settled = new == .idle
                 }
-                .onScrollGeometryChange(for: CGFloat.self, of: { edgeOverscroll($0) }) { _, raw in
-                    if !track.interacting { track.restOverscroll = raw }
-                    // Clamped so ordinary scrolling (negative overscroll) produces no pull.
-                    let value = max(raw, 0)
-                    track.overscroll = value
-                    guard track.interacting, track.eligible else { return }
-                    onPull(value)
-                }
+            }
         } else {
             content
         }
@@ -4556,13 +4453,6 @@ private struct WorkspaceLauncherView: View {
                 .padding(.top, 44)
             }
             .scrollIndicators(.hidden)
-            .scrollBounceBehavior(.always)
-            .modifier(ScrollEdgePullTracker(
-                edge: .bottom,
-                enabled: true,
-                onPull: onCloseDragChanged,
-                onRelease: { onCloseDragEnded($0, $0) }
-            ))
 
             VStack {
                 Spacer()
@@ -4584,6 +4474,21 @@ private struct WorkspaceLauncherView: View {
                 .padding(.bottom, 8)
             }
         }
+        .contentShape(Rectangle())
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 12, coordinateSpace: .global)
+                .onChanged { value in
+                    guard value.translation.height < 0,
+                          abs(value.translation.height) > abs(value.translation.width) else { return }
+                    onCloseDragChanged(-value.translation.height)
+                }
+                .onEnded { value in
+                    onCloseDragEnded(
+                        max(0, -value.translation.height),
+                        max(0, -value.predictedEndTranslation.height)
+                    )
+                }
+        )
     }
 
     @ViewBuilder
@@ -4869,6 +4774,14 @@ struct ConversationListView: View {
     @State private var workspacePullDistance: CGFloat = 0
     @State private var workspaceCloseDistance: CGFloat = 0
     @State private var workspacePullTracking = false
+    @GestureState private var workspacePullGestureRunning = false
+    @State private var conversationListAtTop = true
+    /// When the list last came to rest at the top; a scroll that only just arrived there
+    /// (momentum or the same finger still scrolling up) must not open the workspace.
+    @State private var conversationListAtTopSince = Date.distantPast
+    /// Decided once on the first sample of each drag: nil = undecided, true = may pull.
+    @State private var workspacePullEligible: Bool?
+    @State private var conversationScrollTouch = ScrollTouchState()
     @State private var showingAddWorkspace = false
     @State private var selectedWorkspaceItem: WorkspaceItem?
     @AppStorage("aiConversationsJSON") private var conversationsJSON = ""
@@ -5001,14 +4914,17 @@ struct ConversationListView: View {
                             }
                         }
                         .coordinateSpace(name: "conversation-list-scroll")
-                        .modifier(ScrollEdgePullTracker(
-                            edge: .top,
-                            enabled: !workspaceOpen && selectedConversation == nil && search.isEmpty,
-                            onPull: updateWorkspacePull,
-                            onRelease: finishWorkspacePull
-                        ))
-                        .scrollDisabled(workspaceOpen)
-                        .scrollBounceBehavior(.always)
+                        .onPreferenceChange(ConversationScrollOffsetKey.self) { value in
+                            guard !workspaceLayerVisible else { return }
+                            let atTop = value >= -2
+                            if conversationListAtTop != atTop {
+                                conversationListAtTop = atTop
+                                if atTop { conversationListAtTopSince = Date() }
+                            }
+                        }
+                        .modifier(ScrollTouchTracker(state: conversationScrollTouch))
+                        .scrollDisabled(workspaceLayerVisible)
+                        .scrollBounceBehavior(.basedOnSize)
                         .scrollDismissesKeyboard(.interactively)
                     }
                 }
@@ -5084,6 +5000,7 @@ struct ConversationListView: View {
                 .zIndex(1)
             }
         }
+        .simultaneousGesture(workspacePullGesture)
         .toolbar(workspaceOpen ? .hidden : .automatic, for: .navigationBar)
         .toolbar((workspaceOpen || selectedConversation != nil) ? .hidden : .automatic, for: .tabBar)
         .sheet(isPresented: $showingAddWorkspace) {
@@ -5124,6 +5041,13 @@ struct ConversationListView: View {
             }
         }
         .onChange(of: workspaceOpen) { _, _ in syncRootTabBarVisibility() }
+        .onChange(of: workspacePullGestureRunning) { _, running in
+            // GestureState also resets when another system gesture cancels the drag.
+            if !running {
+                workspacePullEligible = nil
+                if workspacePullTracking { cancelWorkspacePull() }
+            }
+        }
         .onChange(of: store.hasLoadedInitialMessages) { _, _ in syncClaudeUnreadState() }
         .onChange(of: store.msgs.last?.id) { _, _ in syncClaudeUnreadState() }
     }
@@ -5142,35 +5066,73 @@ struct ConversationListView: View {
         return workspacePullDistance
     }
 
-    /// Overscroll beyond the dead zone while the drag started from rest at the top.
-    private func updateWorkspacePull(_ overscroll: CGFloat) {
-        let pulled = overscroll - Self.workspacePullDeadZone
-        guard workspacePullTracking || pulled > 0 else { return }
-        var transaction = Transaction()
-        transaction.disablesAnimations = true
-        withTransaction(transaction) {
-            workspacePullTracking = true
-            workspaceLayerVisible = true
-            workspacePullDistance = min(max(pulled, 0), 280)
-        }
-    }
-
-    private func finishWorkspacePull(_ overscroll: CGFloat) {
-        guard workspacePullTracking else { return }
-        workspacePullTracking = false
-        if overscroll - Self.workspacePullDeadZone >= Self.workspaceOpenThreshold {
-            withAnimation(.snappy(duration: 0.42, extraBounce: 0.02)) {
-                workspaceOpen = true
-                workspacePullDistance = 0
+    private var workspacePullGesture: some Gesture {
+        // The front layer moves during this gesture. Its local coordinate space
+        // would feed that movement back into the next translation sample.
+        DragGesture(minimumDistance: 8, coordinateSpace: .global)
+            .updating($workspacePullGestureRunning) { _, running, _ in
+                running = true
             }
-        } else {
-            cancelWorkspacePull()
-        }
+            .onChanged { value in
+                guard !workspaceOpen, selectedConversation == nil else { return }
+                // Only a drag that starts while the list is already resting at the top may
+                // pull the workspace; scrolling back up to the top never does.
+                if workspacePullEligible == nil {
+                    // The scroll view's own touch record decides whether this finger landed on
+                    // a list already at rest at the top. The drag sample alone cannot: it may
+                    // start (or restart) after the same finger has scrolled the list up to the top.
+                    let touch = conversationScrollTouch
+                    if #available(iOS 18.0, *), !touch.touching, value.translation.height < 20 {
+                        return
+                    }
+                    let landedAtRest: Bool
+                    if #available(iOS 18.0, *), touch.touching {
+                        landedAtRest = touch.beganAtRest &&
+                            touch.touchBeganAt.timeIntervalSince(conversationListAtTopSince) > 0.25
+                    } else {
+                        landedAtRest = Date().timeIntervalSince(conversationListAtTopSince) > 0.25
+                    }
+                    workspacePullEligible = conversationListAtTop &&
+                        landedAtRest &&
+                        search.isEmpty &&
+                        value.translation.height > 0 &&
+                        abs(value.translation.height) > abs(value.translation.width)
+                }
+                guard workspacePullEligible == true else { return }
+                // The first stretch behaves like the normal list bounce; the layer only
+                // starts to show after the dead zone.
+                let pulled = value.translation.height - Self.workspacePullDeadZone
+                guard workspacePullTracking || pulled > 0 else { return }
+                var transaction = Transaction()
+                transaction.disablesAnimations = true
+                withTransaction(transaction) {
+                    workspacePullTracking = true
+                    workspaceLayerVisible = true
+                    workspacePullDistance = min(max(pulled * 0.92, 0), 280)
+                }
+            }
+            .onEnded { value in
+                guard workspacePullTracking else { return }
+                workspacePullTracking = false
+                let shouldOpen = !workspaceOpen && search.isEmpty &&
+                    workspacePullDistance >= Self.workspaceOpenThreshold
+                if shouldOpen {
+                    withAnimation(.snappy(duration: 0.42, extraBounce: 0.02)) {
+                        workspaceOpen = true
+                        workspacePullDistance = 0
+                    }
+                } else {
+                    withAnimation(.snappy(duration: 0.30, extraBounce: 0.02)) {
+                        workspacePullDistance = 0
+                    }
+                    hideWorkspaceLayerAfterAnimation()
+                }
+            }
     }
 
     /// Pull past the dead zone, then this much more, before releasing opens the workspace.
-    private static let workspacePullDeadZone: CGFloat = 30
-    private static let workspaceOpenThreshold: CGFloat = 90
+    private static let workspacePullDeadZone: CGFloat = 24
+    private static let workspaceOpenThreshold: CGFloat = 80
 
     private func cancelWorkspacePull() {
         workspacePullTracking = false
@@ -7393,6 +7355,13 @@ struct AddedAIChatView: View {
     private func localBubbleRow(_ message: LocalAIMessage, proxy: ScrollViewProxy) -> some View {
         LocalAIMessageBubble(message: message, conversation: current,
             onReply: { replyingTo = message; inputFocused = true },
+            onReact: { emoji in
+                changeLocalMessage(message.id) { msg in
+                    var list = msg.reactions ?? []
+                    if list.contains(emoji) { list.removeAll { $0 == emoji } } else { list.append(emoji) }
+                    msg.reactions = list
+                }
+            },
             onMore: { reactionTarget = LocalReactionTarget(id: message.id) },
             onRetract: { changeLocalMessage(message.id) { $0.withdrawn = true } },
             onJump: { id in withAnimation { proxy.scrollTo(id, anchor: .center) } },
@@ -7400,7 +7369,8 @@ struct AddedAIChatView: View {
                 let target = current.kind == "group" ? nameForGroupMember(message.authorID) : current.displayName
                 dispatchUserMessage("我拍了拍「\(target)」", wireText: patText(target: target))
             },
-            onImage: { url in imageViewer = ViewerItem(url: url) })
+            onImage: { url in imageViewer = ViewerItem(url: url) },
+            reactionChoices: Self.emojis)
     }
 
     private var canCombinePendingFiles: Bool {
@@ -8896,32 +8866,44 @@ private struct AlbumCoverTile: View {
 private struct MediaAlbumBubble: View {
     let messages: [Msg]
     let reactions: [String]
-    let showsActions: Bool
     let onImage: (URL) -> Void
     let onReply: () -> Void
     let onReact: (String) -> Void
     let onMoreReactions: () -> Void
     let onRetract: () -> Void
     let onDelete: () -> Void
-    /// Long press; passes the album's global frame captured at press time.
-    let onLongPress: (CGRect) -> Void
+    /// 「选择文字」: enters system text selection for the given selection key.
+    let onSelectText: (String) -> Void
     let onJumpToReply: (Int) -> Void
     let onAvatarDoubleTap: () -> Void
     let onExpansionChange: (Bool) -> Void
     var canRetract = false
     @State private var selectedIndex = 0
     @State private var expanded = false
-    @State private var frameBox = BubbleFrameBox()
-
-    private func press() { onLongPress(frameBox.liveFrame) }
-
-    private func activate(_ rect: CGRect) {
-        // Always anchor to the bubble's own frame; the tap point is only a last resort
-        // when the bubble has not been laid out yet.
-        let box = frameBox.liveFrame
-        onLongPress(box.isEmpty ? rect.insetBy(dx: -14, dy: -9) : box)
-    }
     @Environment(\.chatPeerConversation) private var peer
+
+    private var selectionKey: String { "album:\(messages.first?.id ?? 0)" }
+
+    private var favoriteAction: (() async throws -> Void)? {
+        guard let first = messages.first else { return nil }
+        let peerName = peer?.displayName
+        return { try await FavoriteStore.shared.add(message: first, peerName: peerName) }
+    }
+
+    private var messageMenu: MessageContextMenu {
+        MessageContextMenu(
+            copyText: displayedCaption,
+            selectionKey: selectionKey,
+            reactionChoices: MessageReactionChoices.all,
+            onReply: onReply,
+            onReact: onReact,
+            onMoreReactions: onMoreReactions,
+            onSelectText: onSelectText,
+            onFavorite: favoriteAction,
+            onRetract: canRetract ? onRetract : nil,
+            onDelete: onDelete
+        )
+    }
 
     private var mine: Bool { messages.first?.from == "me" }
     private var caption: String {
@@ -8980,7 +8962,7 @@ private struct MediaAlbumBubble: View {
                             .buttonStyle(.plain)
                         }
                         if !displayedCaption.isEmpty {
-                            SelectableMarkdownText(text: displayedCaption, onActivate: activate, selectionKey: "album:\(messages.first?.id ?? 0)")
+                            SelectableMarkdownText(text: displayedCaption, selectionKey: selectionKey)
                         }
                     }
                     .padding(.horizontal, 14)
@@ -9007,13 +8989,10 @@ private struct MediaAlbumBubble: View {
                         .padding(.horizontal, 4)
                 }
             }
-            .contentShape(Rectangle())
-            .onLongPressGesture(minimumDuration: 0.34, perform: press)
-            .modifier(BubbleFrameReporter(messageID: messages.first?.id ?? 0, box: frameBox, showsActions: showsActions))
+            .modifier(messageMenu)
 
             if mine { Avatar(isMe: true) } else { Spacer(minLength: 0) }
         }
-        .zIndex(showsActions ? 10 : 0)
     }
 
     private var expandButton: some View {
@@ -9164,12 +9143,11 @@ private struct ChatTimeline: View, Equatable {
     let activities: [Int: ChatActivity]
     let hasEarlierMessages: Bool
     let onLoadEarlier: () -> Void
-    let selectedMessageID: Int?
     let highlightedMessageID: Int?
     let unreadStartMessageID: Int?
     let onImage: (URL) -> Void
     let onReply: (Msg) -> Void
-    let onSelectActions: (Int, CGRect) -> Void
+    let onSelectText: (String) -> Void
     let onReact: (Int, String) -> Void
     let onMoreReactions: (Int) -> Void
     let onRetract: (Msg) -> Void
@@ -9203,7 +9181,6 @@ private struct ChatTimeline: View, Equatable {
         lhs.revealedPartCounts == rhs.revealedPartCounts &&
         lhs.activities == rhs.activities &&
         lhs.hasEarlierMessages == rhs.hasEarlierMessages &&
-        lhs.selectedMessageID == rhs.selectedMessageID &&
         lhs.highlightedMessageID == rhs.highlightedMessageID &&
         lhs.unreadStartMessageID == rhs.unreadStartMessageID &&
         lhs.bottomInset == rhs.bottomInset &&
@@ -9303,14 +9280,13 @@ private struct ChatTimeline: View, Equatable {
                         MediaAlbumBubble(
                             messages: albumMessages(id: group.id),
                             reactions: reactions[message.id] ?? [],
-                            showsActions: selectedMessageID == message.id,
                             onImage: onImage,
                             onReply: { onReply(message) },
                             onReact: { onReact(message.id, $0) },
                             onMoreReactions: { onMoreReactions(message.id) },
                             onRetract: { onRetract(message) },
                             onDelete: { onDelete(message) },
-                            onLongPress: { frame in onSelectActions(message.id, frame) },
+                            onSelectText: onSelectText,
                             onJumpToReply: onJumpToReply,
                             onAvatarDoubleTap: onAvatarDoubleTap,
                             onExpansionChange: { onAlbumExpansion(message.id, $0) },
@@ -9323,14 +9299,13 @@ private struct ChatTimeline: View, Equatable {
                     Bubble(
                         msg: message,
                         reactions: reactions[message.id] ?? [],
-                        showsActions: selectedMessageID == message.id,
                         onImage: onImage,
                         onReply: { onReply(message) },
                         onReact: { onReact(message.id, $0) },
                         onMoreReactions: { onMoreReactions(message.id) },
                         onRetract: { onRetract(message) },
                         onDelete: { onDelete(message) },
-                        onLongPress: { frame in onSelectActions(message.id, frame) },
+                        onSelectText: onSelectText,
                         onJumpToReply: onJumpToReply,
                         onAvatarDoubleTap: onAvatarDoubleTap,
                         partText: row.text,
@@ -9873,9 +9848,6 @@ struct ChatView: View {
     @State private var jumpToMessageID: Int?
     @State private var highlightedMessageID: Int?
     @State private var highlightTask: Task<Void, Never>?
-    @State private var selectedMessageID: Int?
-    /// Global frame of the long-pressed bubble, captured at press time.
-    @State private var menuAnchorFrame: CGRect = .zero
     @State private var reactionTargetID: Int?
     @State private var replyingTo: Msg?
     @State private var reEditText: String?
@@ -9886,14 +9858,8 @@ struct ChatView: View {
     @State private var bgLoadTask: Task<Void, Never>?
     @State private var hasMeasuredComposer = false
     @State private var initialScrollReady = false
-    /// 菜单/选字进行中：为 true 时禁止 List 自动滚到底。
-    @State private var isSelectingText = false
-    /// 系统选字模式：点按菜单短路，系统手柄 + 系统菜单接管。
+    /// 系统选字模式：系统手柄 + 系统菜单接管；为 true 时禁止 List 自动滚到底。
     @State private var isSystemSelecting = false
-    /// 选区变化时强制重算菜单位置的计数。
-    @State private var selectionNonce = 0
-    /// 长按菜单实测高度（定位用）。
-    @State private var menuHeight: CGFloat = 110
     @State private var timelineMessages: [Msg] = []
     @State private var timelineLimit = ChatStore.messagePageSize
     @State private var timelineStartID: Int?
@@ -10252,39 +10218,24 @@ struct ChatView: View {
                                     }
                                 }
                             },
-                            selectedMessageID: selectedMessageID,
                             highlightedMessageID: highlightedMessageID,
                             unreadStartMessageID: unreadStartMessageID,
                             onImage: { viewer = ViewerItem(url: $0) },
                             onReply: { message in
                                 replyingTo = message
-                                selectedMessageID = nil
                                 showingAttachments = false
                                 showingReactions = false
                                 inputFocused = true
                             },
-                            onSelectActions: { messageID, frame in
-                                // 系统选字模式下长按交给系统，不再弹菜单。
-                                guard !isSystemSelecting else { return }
-                                // Frame of the gesture's own bubble, captured when the gesture fired.
-                                // Repeated triggers on the same bubble keep the menu open.
-                                menuAnchorFrame = frame
-                                withAnimation(.spring(response: 0.22, dampingFraction: 0.86)) {
-                                    selectedMessageID = messageID
-                                    isSelectingText = true
-                                }
-                            },
+                            onSelectText: { enterSystemSelection(key: $0) },
                             onReact: { messageID, emoji in
                                 store.toggleReaction(emoji, for: messageID)
-                                withAnimation(.easeOut(duration: 0.15)) { selectedMessageID = nil }
                             },
                             onMoreReactions: { messageID in
-                                selectedMessageID = nil
                                 reactionTargetID = messageID
                             },
                             onRetract: { retractMessage($0) },
                             onDelete: { message in
-                                selectedMessageID = nil
                                 store.hideLocally(message)
                             },
                             onJumpToReply: { jumpToMessageID = $0 },
@@ -10310,31 +10261,18 @@ struct ChatView: View {
                         .equatable()
                         .padding(.horizontal, 14)
                         .contentMargins(.top, geo.safeAreaInsets.top + 8, for: .scrollContent)
-                        .chatInitialBottomAnchor(followsSizeChanges: !isSelectingText && !isSystemSelecting)
+                        .chatInitialBottomAnchor(followsSizeChanges: !isSystemSelecting)
                         .transparentTopScrollEdge()
                         .scrollDismissesKeyboard(.interactively)
                         .simultaneousGesture(
                             SpatialTapGesture(coordinateSpace: .global).onEnded { value in
-                                guard !ChatTextSelection.isSelectionInteraction(at: value.location) else { return }
-                                // 点在气泡上时交给气泡自己的点按处理（开/关菜单），这里不抢着关。
-                                if ChatTextSelection.messageFrames.values.contains(where: { $0.contains(value.location) }) { return }
-                                selectedMessageID = nil
-                                isSelectingText = false
-                                if isSystemSelecting {
-                                    isSystemSelecting = false
-                                    ChatTextSelection.systemSelecting = false
-                                    ChatTextSelection.active?.resignFirstResponder()
-                                }
+                                guard isSystemSelecting,
+                                      !ChatTextSelection.isSelectionInteraction(at: value.location) else { return }
+                                isSystemSelecting = false
                                 NotificationCenter.default.post(name: .clearChatTextSelection, object: nil)
+                                ChatTextSelection.endSystemSelection()
                             }
                         )
-                        .onReceive(NotificationCenter.default.publisher(for: .clearChatTextSelection)) { _ in
-                            selectedMessageID = nil
-                        }
-                        .onReceive(NotificationCenter.default.publisher(for: .chatTextSelectionChanged)) { _ in
-                            // 选区/气泡 frame 变化时重算菜单位置（菜单按聊天区坐标系里的 frame 定位）。
-                            if selectedMessageID != nil { selectionNonce += 1 }
-                        }
 
                     ChatComposerView(
                         draftKey: draftKey,
@@ -10373,21 +10311,6 @@ struct ChatView: View {
                         onStagePhotos: { items in stagePhotos(items) }
                     )
 
-                    if let selectedID = selectedMessageID,
-                       let selectedMsg = timelineMessages.first(where: { $0.id == selectedID }) {
-                        // Topmost layer so neither the composer nor the list can swallow taps.
-                        // The anchor is the global frame captured at gesture time; it is
-                        // converted into this layer's own coordinate space.
-                        GeometryReader { layer in
-                            let origin = layer.frame(in: .global).origin
-                            messageMenu(
-                                msg: selectedMsg,
-                                frame: menuAnchorFrame.offsetBy(dx: -origin.x, dy: -origin.y),
-                                geo: geo
-                            )
-                        }
-                        .zIndex(5)
-                    }
                 }
                 .task {
                     guard !initialScrollReady else { return }
@@ -10468,8 +10391,8 @@ struct ChatView: View {
     }
 
     private func followPanel(_ proxy: ScrollViewProxy) {
-        // 菜单/系统选字时不自动滚到底，否则菜单和文字会跑开。
-        guard !isSelectingText && !isSystemSelecting else { return }
+        // 系统选字时不自动滚到底，否则选区会跑开。
+        guard !isSystemSelecting else { return }
         panelScrollTask?.cancel()
         panelScrollTask = Task { @MainActor in
             // Follow the resize twice instead of hammering scrollTo throughout typing/panel animation.
@@ -10486,102 +10409,9 @@ struct ChatView: View {
     }
 
 
-    private func closeMessageMenu() {
-        selectedMessageID = nil
-        isSelectingText = false
-    }
-
-    private func canRetractMessage(_ message: Msg) -> Bool {
-        guard message.from == "me", !store.forwardedMessageIDs.contains(message.id) else { return false }
-        let raw = message.ts > 10_000_000_000 ? Double(message.ts) / 1000 : Double(message.ts)
-        return Date().timeIntervalSince1970 - raw < 120
-    }
-
-    /// “选择”：撤掉菜单，进系统选字（系统手柄 + 系统菜单）。
-    private func enterSystemSelection() {
-        selectedMessageID = nil
-        isSelectingText = false
-        isSystemSelecting = true
-        ChatTextSelection.systemSelecting = true
-        guard let view = ChatTextSelection.active else { return }
-        if let point = ChatTextSelection.tapPoint,
-           let pos = view.closestPosition(to: point),
-           let range = view.tokenizer.rangeEnclosingPosition(pos, with: .word, inDirection: .storage(.forward)) {
-            view.selectedTextRange = range
-        } else {
-            view.selectedRange = NSRange(location: 0, length: view.attributedText.length)
-        }
-        view.becomeFirstResponder()
-    }
-
-    /// 点按菜单：气泡不动，不变暗、不浮起、不带表情条，只在气泡附近弹出选择框。
-    @ViewBuilder
-    private func messageMenu(msg: Msg, frame: CGRect, geo: GeometryProxy) -> some View {
-        let mine = msg.from == "me"
-        let isAlbum = MediaGroupInfo.parse(msg.text) != nil
-        let selectionKey = isAlbum ? "album:\(msg.id)" : "remote:\(msg.id)"
-        let copyText = isAlbum ? MediaGroupInfo.batchCaption(msg.text) : msg.displayedText
-        let topInset = geo.safeAreaInsets.top
-        let visibleBottom = geo.size.height - composerHeight - 8
-        let menuH = menuHeight
-        // Menu sits above the pressed bubble; falls back to below it when the
-        // top bar would cover it. Clamped so it never lands under the nav bar.
-        let topLimit = topInset + 52
-        let belowY = frame.maxY + 8 + menuH / 2
-        let aboveY = frame.minY - 8 - menuH / 2
-        let menuY = aboveY - menuH / 2 >= topLimit
-            ? aboveY
-            : min(max(belowY, topLimit + menuH / 2), visibleBottom - menuH / 2)
-        let menuX = mine
-            ? min(max(frame.maxX - 129, 137), geo.size.width - 137)
-            : min(max(frame.minX + 129, 137), geo.size.width - 137)
-        let showSelect = !copyText.isEmpty && ChatTextSelection.active?.selectionKey == selectionKey
-        ZStack {
-            // 透明点按层：点菜单以外的地方关菜单，不遮挡、不变暗。
-            Color.clear
-                .contentShape(Rectangle())
-                .onTapGesture {
-                    closeMessageMenu()
-                    NotificationCenter.default.post(name: .clearChatTextSelection, object: nil)
-                }
-            MessageActionBar(
-                onReply: {
-                    replyingTo = msg
-                    closeMessageMenu()
-                    showingAttachments = false
-                    showingReactions = false
-                    inputFocused = true
-                },
-                onReact: { emoji in
-                    store.toggleReaction(emoji, for: msg.id)
-                    closeMessageMenu()
-                },
-                onMore: {
-                    reactionTargetID = msg.id
-                    closeMessageMenu()
-                },
-                onSelectText: showSelect ? { enterSystemSelection() } : nil,
-                onDismiss: { closeMessageMenu() },
-                externalPositioning: true,
-                onHeightChange: { menuHeight = $0 },
-                onRetract: {
-                    retractMessage(msg)
-                    closeMessageMenu()
-                },
-                onDelete: {
-                    store.hideLocally(msg)
-                    closeMessageMenu()
-                },
-                copyText: copyText,
-                mine: canRetractMessage(msg),
-                selectionKey: selectionKey,
-                onFavorite: { try await FavoriteStore.shared.add(message: msg, peerName: peerName) }
-            )
-            .position(x: menuX, y: menuY)
-            .transition(.opacity)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .transition(.opacity)
+    /// 「选择文字」: system selection handles and the system edit menu on that message.
+    private func enterSystemSelection(key: String) {
+        isSystemSelecting = ChatTextSelection.beginSystemSelection(key: key)
     }
 
     private func sendDraft(_ rawText: String, restoreDraft: @escaping (String) -> Void) {
@@ -10682,7 +10512,6 @@ struct ChatView: View {
     }
 
     private func retractMessage(_ message: Msg) {
-        selectedMessageID = nil
         let targets: [Msg]
         if let group = MediaGroupInfo.parse(message.text) {
             targets = store.msgs.filter { MediaGroupInfo.parse($0.text)?.id == group.id }
@@ -10852,7 +10681,6 @@ struct ChatView: View {
     }
 
     private func sendPat() {
-        selectedMessageID = nil
         let cleanSuffix = patSuffix.trimmingCharacters(in: .whitespacesAndNewlines)
         let text = PatInfo.encode(
             actor: "我",
@@ -13218,65 +13046,6 @@ struct BubbleGlass<S: InsettableShape>: ViewModifier {
             }
             .overlay(shape.strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5))
             .shadow(color: Color.black.opacity(0.06), radius: 9, y: 3)
-    }
-}
-
-/// Per-bubble frame holder; a reference type so geometry updates do not re-render the bubble.
-final class BubbleFrameBox {
-    var frame: CGRect = .zero
-    /// UIKit view laid out exactly over the bubble. List cells are moved by UIKit while
-    /// scrolling, so SwiftUI geometry callbacks can lag behind; the probe is read at
-    /// trigger time to get the bubble's current window frame.
-    weak var probe: UIView?
-
-    /// Current global (window) frame of the bubble.
-    var liveFrame: CGRect {
-        if let probe, probe.window != nil {
-            let rect = probe.convert(probe.bounds, to: nil)
-            if !rect.isEmpty { frame = rect; return rect }
-        }
-        return frame
-    }
-}
-
-/// Invisible, non-interactive UIView used to read a bubble's live window frame.
-private struct BubbleFrameProbe: UIViewRepresentable {
-    let box: BubbleFrameBox
-
-    func makeUIView(context: Context) -> UIView {
-        let view = UIView()
-        view.isUserInteractionEnabled = false
-        view.backgroundColor = .clear
-        box.probe = view
-        return view
-    }
-
-    func updateUIView(_ view: UIView, context: Context) {
-        box.probe = view
-    }
-}
-
-/// Tracks a bubble's global frame into its own box and the id-keyed lookup table.
-private struct BubbleFrameReporter: ViewModifier {
-    let messageID: Int
-    let box: BubbleFrameBox
-    let showsActions: Bool
-
-    func body(content: Content) -> some View {
-        content
-            .background(BubbleFrameProbe(box: box).allowsHitTesting(false))
-            .onGeometryChange(for: CGRect.self, of: { $0.frame(in: .global) }) { frame in
-                box.frame = frame
-                ChatTextSelection.messageFrames[messageID] = frame
-                if showsActions {
-                    NotificationCenter.default.post(name: .chatTextSelectionChanged, object: nil)
-                }
-            }
-            .onDisappear {
-                if ChatTextSelection.messageFrames[messageID] == box.frame {
-                    ChatTextSelection.messageFrames.removeValue(forKey: messageID)
-                }
-            }
     }
 }
 
