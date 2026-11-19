@@ -288,6 +288,16 @@ class H(http.server.SimpleHTTPRequestHandler):
 
     def do_GET(s):
         u = urllib.parse.urlparse(s.path)
+        if u.path == "/api/memory":
+            # 记忆卡片：手机端整份上传，这里原样存一份供服务端读取
+            if not s._authed():
+                return s._json(401, {"error": "pass"})
+            f = DATA / "memory_cards.json"
+            try:
+                cards = json.loads(f.read_text(encoding="utf-8")) if f.exists() else []
+            except Exception:
+                cards = []
+            return s._json(200, {"cards": cards})
         if u.path in ("/web", "/web/"):
             # 电脑浏览器用的宽屏网页版，只是一个静态页，接口全部复用
             data = (ROOT / "web.html").read_bytes()
@@ -440,6 +450,18 @@ class H(http.server.SimpleHTTPRequestHandler):
                 return s._json(502, {"error": "empty"})
             return s._json(200, {"group_id": b["group_id"], "member_id": "claude",
                                  "request_id": b.get("request_id"), "text": result})
+        if u.path == "/api/memory":
+            if not s._authed():
+                return s._json(401, {"error": "pass"})
+            b = s._body(limit=8_000_000)
+            cards = b.get("cards") if isinstance(b, dict) else b
+            if not isinstance(cards, list):
+                return s._json(400, {"error": "cards"})
+            f = DATA / "memory_cards.json"
+            tmp = f.with_suffix(".tmp")
+            tmp.write_text(json.dumps(cards, ensure_ascii=False, indent=1), encoding="utf-8")
+            tmp.replace(f)
+            return s._json(200, {"ok": True, "count": len(cards)})
         if u.path == "/api/send":
             if not s._authed():
                 return s._json(401, {"error": "pass"})

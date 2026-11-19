@@ -59,7 +59,10 @@ struct BearMailboxApp: App {
                 #else
                 RootView()
                 #endif
-            }.preferredColorScheme(preferredScheme)
+            }
+            .overlay { MemoryBannerOverlay() }
+            .task { await MemoryStore.shared.pullOnce() }
+            .preferredColorScheme(preferredScheme)
         }
     }
 }
@@ -3668,7 +3671,7 @@ private enum AIProviderError: LocalizedError {
     }
 }
 
-private enum AIProviderClient {
+enum AIProviderClient {
     static func fetchModels(baseURL: String, apiKey: String, format: String) async throws -> [String] {
         guard !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw AIProviderError.missingCredential
@@ -8535,6 +8538,15 @@ private struct ConfiguredAIChatDetailsView: View {
                             }
                             .buttonStyle(.plain)
 
+                            if MemoryEngine.isEligible(conversation) {
+                                NavigationLink { MemorySpaceView(assistantID: conversation.id) } label: {
+                                    Label("它的记忆", systemImage: "brain")
+                                        .font(.system(size: 14, weight: .medium))
+                                        .padding(.horizontal, 16).padding(.vertical, 7)
+                                        .modifier(Glass(shape: Capsule()))
+                                }.buttonStyle(.plain)
+                            }
+
                             Button { showingGroup = true } label: {
                                 Label("添加成员", systemImage: "person.badge.plus")
                                     .font(.system(size: 14, weight: .medium))
@@ -11783,6 +11795,11 @@ struct MeView: View {
                             Divider().opacity(0.24)
                             NavigationLink { ThemeSettingsView() } label: {
                                 profileMenuRow("主题", systemImage: "paintpalette")
+                            }
+                            .buttonStyle(.plain)
+                            Divider().opacity(0.24)
+                            NavigationLink { MemorySpaceView() } label: {
+                                profileMenuRow("记忆空间", systemImage: "brain")
                             }
                             .buttonStyle(.plain)
 

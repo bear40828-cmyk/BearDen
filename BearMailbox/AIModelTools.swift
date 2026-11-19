@@ -236,16 +236,21 @@ enum AIModelTools {
         return message
     }
 
-    static func send(messages: [LocalAIMessage], conversation: AIConversation, apiKey: String,
+    static func send(messages fullHistory: [LocalAIMessage], conversation: AIConversation, apiKey: String,
                      groupID: String? = nil,
                      onActivity: ChatActivityHandler? = nil,
                      onDelta: (@Sendable (String) async -> Void)? = nil) async throws -> String {
         var activity = ChatActivity()
+        // Memory: only the recent window goes out verbatim; older turns live on as memory cards.
+        let usesMemory = groupID == nil
+        let messages = usesMemory ? MemoryEngine.window(fullHistory, conversation: conversation) : fullHistory
+        let memoryBlock = usesMemory ? await MemoryEngine.contextBlock(for: messages, conversation: conversation) : ""
+        if usesMemory { MemoryEngine.scheduleExtraction(all: fullHistory, conversation: conversation, apiKey: apiKey) }
         let format = (conversation.interfaceFormat ?? "").lowercased()
         let catalog: [[String: Any]]
         // Chat remains usable offline from Moments, but we never advertise unavailable tools.
         do { catalog = try await fetchCatalog() } catch { catalog = [] }
-        let system = "你在熊窝里的昵称是\(conversation.name)。你只有在真正调用工具并收到结果后才能说已查看、发布、评论或修改；没有工具时请说明需要在熊窝验证共享功能。自然地和用户对话。\n\n\(MessageBubbleSplitter.promptInstruction)"
+        let system = "你在熊窝里的昵称是\(conversation.name)。你只有在真正调用工具并收到结果后才能说已查看、发布、评论或修改；没有工具时请说明需要在熊窝验证共享功能。自然地和用户对话。\n\n\(MessageBubbleSplitter.promptInstruction)" + memoryBlock
         let normalized = (conversation.baseURL ?? "").trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
         guard !apiKey.isEmpty else { throw AIModelToolError.invalidResponse("请先设置 API Key") }
         if format.contains("anthropic") {
