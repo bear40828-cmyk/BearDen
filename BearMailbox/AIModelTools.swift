@@ -13,7 +13,9 @@ enum AIModelTools {
     }
     private static func sendResponsesCore(messages: [LocalAIMessage], conversation: AIConversation, accessToken: String, onActivity: ChatActivityHandler? = nil) async throws -> String {
         var activity = ChatActivity()
-        let catalog = ((try? await fetchCatalog()) ?? []) + LocalAITools.catalog(memory: false)
+        let memoryTools = MemoryEngine.isEligible(conversation) && MemorySettings.enabled(for: conversation.id)
+        let memoryBlock = await MemoryEngine.contextBlock(for: messages, conversation: conversation)
+        let catalog = ((try? await fetchCatalog()) ?? []) + LocalAITools.catalog(memory: memoryTools)
         var input: [[String: Any]] = messages.filter { $0.withdrawn != true }.map { message in
             if message.role == "assistant" { return ["role":"assistant", "content":message.text] }
             let blocks = userContent(message, format: "openai") as? [[String: Any]] ?? []
@@ -29,7 +31,7 @@ enum AIModelTools {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.httpBody = try JSONSerialization.data(withJSONObject: [
                 "model":conversation.model ?? "", "store":false, "stream":false,
-                "instructions":LocalAITools.timePreamble + "你在熊窝里的昵称是\(conversation.name)。只有真正执行工具后才能声称已操作朋友圈、相册、收藏；不可用时明确说明。" + LocalAITools.toolHint(memory: false) + "\n\n\(MessageBubbleSplitter.promptInstruction)",
+                "instructions":LocalAITools.timePreamble + "你在熊窝里的昵称是\(conversation.name)。只有真正执行工具后才能声称已操作朋友圈、相册、收藏；不可用时明确说明。" + LocalAITools.toolHint(memory: memoryTools) + "\n\n\(MessageBubbleSplitter.promptInstruction)" + memoryBlock,
                 "input":input,
                 "tools":catalog.map { ["type":"function", "name":$0["name"] ?? "", "description":$0["description"] ?? "", "parameters":$0["inputSchema"] ?? [:]] }
             ])
@@ -263,12 +265,14 @@ enum AIModelTools {
                                  onDelta: (@Sendable (String) async -> Void)?) async throws -> String {
         var activity = ChatActivity()
         // Memory: only the recent window goes out verbatim; older turns live on as memory cards.
-        let usesMemory = groupID == nil
-        let memoryTools = usesMemory && MemoryEngine.isEligible(conversation) && MemorySettings.enabled(for: conversation.id)
-        let windowed = usesMemory ? MemoryEngine.window(fullHistory, conversation: conversation) : fullHistory
+        // Group replies (groupID set) still carry the member's own memory and tools; only
+        // windowing and extraction are limited to the member's private chat.
+        let privateChat = groupID == nil
+        let memoryTools = MemoryEngine.isEligible(conversation) && MemorySettings.enabled(for: conversation.id)
+        let windowed = privateChat ? MemoryEngine.window(fullHistory, conversation: conversation) : fullHistory
         let messages = LocalAITools.stamped(windowed)
-        let memoryBlock = usesMemory ? await MemoryEngine.contextBlock(for: windowed, conversation: conversation) : ""
-        if usesMemory { MemoryEngine.scheduleExtraction(all: fullHistory, conversation: conversation, apiKey: apiKey) }
+        let memoryBlock = await MemoryEngine.contextBlock(for: windowed, conversation: conversation)
+        if privateChat { MemoryEngine.scheduleExtraction(all: fullHistory, conversation: conversation, apiKey: apiKey) }
         let format = (conversation.interfaceFormat ?? "").lowercased()
         let catalog: [[String: Any]]
         // Chat remains usable offline from Moments, but we never advertise unavailable tools.

@@ -400,7 +400,7 @@ enum MemoryEngine {
     }
 
     static func isEligible(_ conversation: AIConversation) -> Bool {
-        conversation.kind != "group" && conversation.authMode != "订阅账号"
+        conversation.kind != "group"
     }
 
     /// Index where the last `turns` user turns start.
