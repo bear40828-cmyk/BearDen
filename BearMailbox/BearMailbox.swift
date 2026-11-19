@@ -1999,7 +1999,6 @@ struct Bubble: View {
         MessageContextMenu(
             copyText: msg.displayedText,
             selectionKey: selectionKey,
-            reactionChoices: MessageReactionChoices.all,
             onReply: onReply,
             onReact: onReact,
             onMoreReactions: onMoreReactions,
@@ -2078,7 +2077,6 @@ struct Bubble: View {
             }
         } else if let f = msg.file {
             VStack(alignment: mine ? .trailing : .leading, spacing: 6) {
-                if reply != nil { textBubble(text: msg.displayedText, showsReply: true) }
                 Button { openingFile = true } label: {
                     Label(f.replacingOccurrences(of: "^\\d+-", with: "", options: .regularExpression),
                           systemImage: "doc.fill")
@@ -2089,6 +2087,9 @@ struct Bubble: View {
                 .buttonStyle(.plain)
                 .fullScreenCover(isPresented: $openingFile) {
                     FileMessageViewer(name: f, onFavorite: { try await FavoriteStore.shared.add(message: msg, peerName: peer?.displayName) })
+                }
+                if reply != nil || !msg.displayedText.isEmpty {
+                    textBubble(text: msg.displayedText, showsReply: true)
                 }
             }
         } else if bubbleParts.count <= 1 {
@@ -2183,22 +2184,62 @@ private struct LocationMessageCard: View {
     }
 }
 
-/// Reaction emoji offered in a message's 「贴表情」 submenu.
-enum MessageReactionChoices {
-    static let all = [
-        "😀", "😄", "😁", "😂", "🤣", "😊", "🥰",
-        "😍", "😘", "😋", "😎", "🤩", "🥳", "😏",
-        "🥺", "😭", "😤", "😡", "🤯", "😴", "🤔",
-        "🙄", "😶", "🫠", "🤡", "👀", "👍", "🫶",
-        "❤️", "💗", "✨", "🎉", "🔥", "🌚", "🫪"
-    ]
+/// Text field that always asks for the system emoji keyboard.
+private final class EmojiInputField: UITextField {
+    override var textInputMode: UITextInputMode? {
+        UITextInputMode.activeInputModes.first { $0.primaryLanguage == "emoji" } ?? super.textInputMode
+    }
+}
+
+/// 「贴表情」: shows the system emoji keyboard through a hidden field; the first emoji
+/// typed becomes the reaction.
+@MainActor
+private final class EmojiReactionPicker: NSObject, UITextFieldDelegate {
+    static let shared = EmojiReactionPicker()
+    private let field = EmojiInputField(frame: CGRect(x: -100, y: -100, width: 1, height: 1))
+    private var onPick: ((String) -> Void)?
+
+    private override init() {
+        super.init()
+        field.delegate = self
+        field.alpha = 0.01
+        field.autocorrectionType = .no
+        field.spellCheckingType = .no
+        field.addTarget(self, action: #selector(changed), for: .editingChanged)
+    }
+
+    func present(_ onPick: @escaping (String) -> Void) {
+        guard let window = UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene })
+            .flatMap(\.windows)
+            .first(where: \.isKeyWindow) else { return }
+        self.onPick = onPick
+        field.text = ""
+        if field.superview !== window { window.addSubview(field) }
+        field.becomeFirstResponder()
+    }
+
+    @objc private func changed() {
+        guard let first = field.text?.first else { return }
+        let emoji = String(first)
+        field.text = ""
+        let pick = onPick
+        onPick = nil
+        field.resignFirstResponder()
+        pick?(emoji)
+    }
+
+    func textFieldDidEndEditing(_ textField: UITextField) {
+        onPick = nil
+        textField.text = ""
+        textField.removeFromSuperview()
+    }
 }
 
 /// System long-press context menu for a message bubble (lifted preview + action list).
 private struct MessageContextMenu: ViewModifier {
     let copyText: String
     let selectionKey: String
-    let reactionChoices: [String]
     var cornerRadius: CGFloat = 22
     let onReply: () -> Void
     let onReact: (String) -> Void
@@ -2278,17 +2319,9 @@ private struct MessageContextMenu: ViewModifier {
                 Label("翻译", systemImage: "translate")
             }
         }
-        Menu {
-            ForEach(reactionChoices, id: \.self) { emoji in
-                Button(emoji) { onReact(emoji) }
-            }
-            if let onMoreReactions {
-                Button {
-                    afterMenuCloses(onMoreReactions)
-                } label: {
-                    Label("更多表情", systemImage: "ellipsis")
-                }
-            }
+        Button {
+            let react = onReact
+            afterMenuCloses { EmojiReactionPicker.shared.present(react) }
         } label: {
             Label("贴表情", systemImage: "face.smiling")
         }
@@ -2389,9 +2422,25 @@ private enum ChatTextSelection {
         if let old = active, old !== view { endSystemSelection() }
         systemSelecting = true
         active = view
+        // Keep the enclosing list exactly where it is while the text view takes focus.
+        var container = view.superview
+        while let c = container, !(c is UIScrollView) { container = c.superview }
+        let list = container as? UIScrollView
+        let offset = list?.contentOffset
         view.isSelectable = true
         view.becomeFirstResponder()
         view.selectedRange = NSRange(location: 0, length: view.attributedText.length)
+        if let list, let offset {
+            list.setContentOffset(offset, animated: false)
+            Task { @MainActor in
+                for delay in [0, 120, 300] {
+                    try? await Task.sleep(for: .milliseconds(delay))
+                    guard ChatTextSelection.systemSelecting, ChatTextSelection.active === view,
+                          !list.isTracking, !list.isDecelerating else { return }
+                    if list.contentOffset != offset { list.setContentOffset(offset, animated: false) }
+                }
+            }
+        }
         return true
     }
 
@@ -3492,7 +3541,6 @@ private struct LocalAIMessageBubble: View, Equatable {
     var onJump: (UUID) -> Void = { _ in }
     var onPat: () -> Void = {}
     var onImage: (URL) -> Void = { _ in }
-    var reactionChoices: [String] = MessageReactionChoices.all
 
     private var mine: Bool { message.role == "user" }
     private var senderConversation: AIConversation {
@@ -3569,7 +3617,6 @@ private struct LocalAIMessageBubble: View, Equatable {
         MessageContextMenu(
             copyText: message.text,
             selectionKey: "local:\(message.id)",
-            reactionChoices: reactionChoices,
             onReply: onReply,
             onReact: onReact,
             onMoreReactions: onMore,
@@ -4337,6 +4384,10 @@ private final class ScrollTouchState {
     /// Whether the current touch landed while the content was idle (not mid-momentum).
     var beganAtRest = false
     var touchBeganAt = Date.distantPast
+    /// Kept current by the owner: whether the content is scrolled to its very top.
+    var atTop = true
+    /// Whether the content was at its very top when the current touch landed.
+    var beganAtTop = false
     fileprivate var settled = true
 }
 
@@ -4351,6 +4402,7 @@ private struct ScrollTouchTracker: ViewModifier {
                         state.touching = true
                         state.touchBeganAt = Date()
                         state.beganAtRest = old == .idle && state.settled
+                        state.beganAtTop = state.atTop
                     }
                 } else {
                     state.touching = false
@@ -4917,6 +4969,7 @@ struct ConversationListView: View {
                         .onPreferenceChange(ConversationScrollOffsetKey.self) { value in
                             guard !workspaceLayerVisible else { return }
                             let atTop = value >= -2
+                            conversationScrollTouch.atTop = atTop
                             if conversationListAtTop != atTop {
                                 conversationListAtTop = atTop
                                 if atTop { conversationListAtTopSince = Date() }
@@ -5045,7 +5098,7 @@ struct ConversationListView: View {
             // GestureState also resets when another system gesture cancels the drag.
             if !running {
                 workspacePullEligible = nil
-                if workspacePullTracking { cancelWorkspacePull() }
+                if workspacePullTracking || (!workspaceOpen && workspacePullDistance != 0) { cancelWorkspacePull() }
             }
         }
         .onChange(of: store.hasLoadedInitialMessages) { _, _ in syncClaudeUnreadState() }
@@ -5087,7 +5140,9 @@ struct ConversationListView: View {
                     }
                     let landedAtRest: Bool
                     if #available(iOS 18.0, *), touch.touching {
-                        landedAtRest = touch.beganAtRest &&
+                        // Position at touch-down decides; reaching the top later in the
+                        // same drag never counts.
+                        landedAtRest = touch.beganAtRest && touch.beganAtTop &&
                             touch.touchBeganAt.timeIntervalSince(conversationListAtTopSince) > 0.25
                     } else {
                         landedAtRest = Date().timeIntervalSince(conversationListAtTopSince) > 0.25
@@ -5112,7 +5167,12 @@ struct ConversationListView: View {
                 }
             }
             .onEnded { value in
-                guard workspacePullTracking else { return }
+                workspacePullEligible = nil
+                guard workspacePullTracking else {
+                    // Never leave a partly pulled layer behind.
+                    if !workspaceOpen && (workspacePullDistance != 0 || workspaceLayerVisible) { cancelWorkspacePull() }
+                    return
+                }
                 workspacePullTracking = false
                 let shouldOpen = !workspaceOpen && search.isEmpty &&
                     workspacePullDistance >= Self.workspaceOpenThreshold
@@ -7369,8 +7429,7 @@ struct AddedAIChatView: View {
                 let target = current.kind == "group" ? nameForGroupMember(message.authorID) : current.displayName
                 dispatchUserMessage("我拍了拍「\(target)」", wireText: patText(target: target))
             },
-            onImage: { url in imageViewer = ViewerItem(url: url) },
-            reactionChoices: Self.emojis)
+            onImage: { url in imageViewer = ViewerItem(url: url) })
     }
 
     private var canCombinePendingFiles: Bool {
@@ -8894,7 +8953,6 @@ private struct MediaAlbumBubble: View {
         MessageContextMenu(
             copyText: displayedCaption,
             selectionKey: selectionKey,
-            reactionChoices: MessageReactionChoices.all,
             onReply: onReply,
             onReact: onReact,
             onMoreReactions: onMoreReactions,
@@ -9860,6 +9918,7 @@ struct ChatView: View {
     @State private var initialScrollReady = false
     /// 系统选字模式：系统手柄 + 系统菜单接管；为 true 时禁止 List 自动滚到底。
     @State private var isSystemSelecting = false
+    @State private var timelineRefreshPending = false
     @State private var timelineMessages: [Msg] = []
     @State private var timelineLimit = ChatStore.messagePageSize
     @State private var timelineStartID: Int?
@@ -9911,6 +9970,11 @@ struct ChatView: View {
 
 
     private func refreshTimeline(_ source: [Msg]? = nil) {
+        // Reloading rows during system selection would move or drop the selected text.
+        if isSystemSelecting {
+            timelineRefreshPending = true
+            return
+        }
         // Run on message/history changes, never on each composer keystroke.
         // 自己撤回的消息保留在时间线里，渲染成撤回提示。
         let eligible = (source ?? store.msgs).filter { $0.id > effectiveHiddenThroughID && !store.isHiddenLocally($0.id) && ($0.from == "me" || !store.isRetracted($0.id)) }
@@ -10336,7 +10400,14 @@ struct ChatView: View {
                     }
                 }
                 .onChange(of: hiddenThroughID) { _, _ in
+                    guard !isSystemSelecting else { return }
                     jumpWithoutAnimation(proxy, to: bottomAnchor, anchor: .bottom)
+                }
+                .onChange(of: isSystemSelecting) { _, selecting in
+                    if !selecting && timelineRefreshPending {
+                        timelineRefreshPending = false
+                        refreshTimeline()
+                    }
                 }
                 .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardDidShowNotification)) { _ in
                     followPanel(proxy)
@@ -13071,18 +13142,45 @@ enum ChatBubblePalette {
         "chatBubbleColor.\(style.rawValue).\(mine ? "mine" : "peer")"
     }
 
-    static func defaultHex(_ style: ChatBubbleStyle, mine: Bool) -> String {
-        switch style {
-        case .clay: return mine ? "F6C9D6" : "CFE0F7"
-        default: return mine ? "F7DDE4" : "DCE8F5"
-        }
+    struct Preset {
+        let name: String
+        /// Solid clay fill.
+        let clay: String
+        /// Droplet top / middle / bottom tints (used at 58% opacity).
+        let droplet: (String, String, String)
     }
 
-    static let dropletPresets = ["F7DDE4", "DCE8F5", "DDF0E6", "F7F1D8", "ECE6F5", "F8E3D4", "E9ECEF"]
-    static let clayPresets = ["F6C9D6", "CFE0F7", "D4F0C8", "FBF0C4", "DCD3F3", "FAD6C0", "E3E6EA"]
+    /// Pale macaron palette shared by the droplet and clay styles.
+    static let palette: [Preset] = [
+        Preset(name: "奶油黄", clay: "F9F0C8", droplet: ("F4F3E1", "FAF8E2", "F6F1D5")),
+        Preset(name: "樱花粉", clay: "F4C9E3", droplet: ("F3EAF2", "F7EDF5", "F4E1EE")),
+        Preset(name: "雾蓝", clay: "DCE8FC", droplet: ("E6ECF4", "EAF1F9", "DCE7F5")),
+        Preset(name: "浅薰衣草", clay: "E6DCF5", droplet: ("E8E7F1", "EFEAF9", "E6E0F5")),
+        Preset(name: "薄荷绿", clay: "E1F3DD", droplet: ("E1F0EC", "E4F7F1", "D3EFE5")),
+        Preset(name: "蜜桃杏", clay: "FADDC8", droplet: ("F5ECE4", "FAF0E8", "F7E2D4"))
+    ]
+
+    static func presetHex(_ p: Preset, _ style: ChatBubbleStyle) -> String {
+        style == .clay ? p.clay : p.droplet.1
+    }
+
+    static func defaultHex(_ style: ChatBubbleStyle, mine: Bool) -> String {
+        presetHex(palette[mine ? 1 : 2], style)
+    }
 
     static func presets(_ style: ChatBubbleStyle) -> [String] {
-        style == .clay ? clayPresets : dropletPresets
+        palette.map { presetHex($0, style) }
+    }
+
+    /// Droplet gradient stops for a stored hex: the preset triple when it matches,
+    /// otherwise a triple derived from the chosen color.
+    static func dropletStops(_ hex: String) -> (Color, Color, Color) {
+        let h = hex.uppercased()
+        if let p = palette.first(where: { $0.droplet.1 == h }) {
+            return (Color(hexString: p.droplet.0) ?? .white, Color(hexString: p.droplet.1) ?? .white, Color(hexString: p.droplet.2) ?? .white)
+        }
+        let mid = Color(hexString: h) ?? .white
+        return (mid.deepened(0.015), mid, mid.deepened(0.03))
     }
 
     static func color(_ style: ChatBubbleStyle, mine: Bool) -> Color {
@@ -13162,30 +13260,46 @@ enum ChatFontChoice: String, CaseIterable {
     var swiftUIFont: Font { Font(uiFont(size: 16)) }
 }
 
-/// Upper-left crescent highlight used by the droplet bubble.
+/// Small crescent highlight of the droplet bubble: the top border of a 17x10 box with
+/// asymmetric rounded top corners, rotated -26 degrees.
 private struct DropletHighlight: View {
     var body: some View {
-        ZStack(alignment: .topLeading) {
-            // Soft white sheen behind the crescent.
-            Capsule()
-                .fill(Color.white.opacity(0.55))
-                .frame(width: 26, height: 7)
-                .blur(radius: 3)
-                .rotationEffect(.degrees(-18))
-                .offset(x: 6, y: 4)
-            Circle()
-                .trim(from: 0.55, to: 0.72)
-                .stroke(Color.white, style: StrokeStyle(lineWidth: 3.4, lineCap: .round))
-                .frame(width: 34, height: 34)
-                .shadow(color: Color.white.opacity(0.9), radius: 1.5)
-            Circle()
-                .fill(Color.white)
-                .frame(width: 4, height: 4)
-                .offset(x: 22, y: 2)
+        Path { p in
+            // Corner radii 65%/50% scaled to fit (CSS radius clamping).
+            let k: CGFloat = 17 / 19.5
+            let lx = 11.05 * k, ly = 6.5 * k, rx = 8.5 * k, ry = 5 * k
+            p.move(to: CGPoint(x: 0, y: ly))
+            p.addQuadCurve(to: CGPoint(x: lx, y: 0), control: CGPoint(x: 0, y: 0))
+            p.addLine(to: CGPoint(x: 17 - rx, y: 0))
+            p.addQuadCurve(to: CGPoint(x: 17, y: ry), control: CGPoint(x: 17, y: 0))
         }
-        .padding(.leading, 5)
-        .padding(.top, 3)
+        .stroke(Color.white.opacity(0.82), style: StrokeStyle(lineWidth: 2, lineCap: .round))
+        .frame(width: 17, height: 10)
+        .rotationEffect(.degrees(-26))
+        .blur(radius: 0.25)
         .allowsHitTesting(false)
+    }
+}
+
+/// CSS-style inset box-shadow: a blurred band outside the (spread-adjusted) shape,
+/// offset, then masked to the shape.
+struct BubbleInsetShadow<S: InsettableShape>: View {
+    let shape: S
+    let color: Color
+    var x: CGFloat = 0
+    var y: CGFloat = 0
+    /// CSS blur length; SwiftUI blur radius is half of it.
+    var blur: CGFloat = 0
+    var spread: CGFloat = 0
+
+    var body: some View {
+        let band: CGFloat = 40
+        shape
+            .inset(by: spread - band / 2)
+            .stroke(color, lineWidth: band)
+            .offset(x: x, y: y)
+            .blur(radius: blur / 2)
+            .mask(shape)
     }
 }
 
@@ -13225,71 +13339,58 @@ struct ChatTextBubbleBackground: ViewModifier {
                 .compositingGroup()
                 .shadow(color: Color.black.opacity(0.05), radius: 8, y: 2)
         case .droplet:
-            let tint = Color(hexString: dropletHex) ?? .white
-            let capsule = RoundedRectangle(cornerRadius: 24, style: .continuous)
+            let stops = ChatBubblePalette.dropletStops(dropletHex)
+            let capsule = Capsule(style: .continuous)
             content
                 .environment(\.colorScheme, .light)
                 .background {
                     ZStack {
-                        // Translucent tinted body.
-                        capsule.fill(tint.opacity(0.62))
-                        // Glossy upper half, slightly deeper lower edge for a rounded, filled look.
                         capsule.fill(LinearGradient(
-                            stops: [.init(color: Color.white.opacity(0.62), location: 0),
-                                    .init(color: Color.white.opacity(0.18), location: 0.42),
-                                    .init(color: Color.white.opacity(0), location: 0.62),
-                                    .init(color: tint.deepened(0.16).opacity(0.38), location: 1)],
-                            startPoint: .top, endPoint: .bottom
-                        ))
-                        // Soft inner glow just inside the rim.
-                        capsule
-                            .stroke(Color.white.opacity(0.85), lineWidth: 5)
-                            .blur(radius: 3.5)
-                            .clipShape(capsule)
+                            stops: [.init(color: stops.0.opacity(0.58), location: 0),
+                                    .init(color: stops.1.opacity(0.58), location: 0.46),
+                                    .init(color: stops.2.opacity(0.58), location: 1)],
+                            startPoint: .top, endPoint: .bottom))
+                        capsule.fill(LinearGradient(
+                            stops: [.init(color: Color(red: 215/255, green: 214/255, blue: 220/255).opacity(0.12), location: 0),
+                                    .init(color: Color.white.opacity(0.075), location: 0.30),
+                                    .init(color: Color.white.opacity(0.025), location: 0.60),
+                                    .init(color: Color(red: 205/255, green: 205/255, blue: 209/255).opacity(0.045), location: 1)],
+                            startPoint: .top, endPoint: .bottom))
                     }
                 }
                 .overlay {
-                    // Bright rim: white along the top, tinted along the bottom.
-                    capsule.strokeBorder(
-                        LinearGradient(colors: [Color.white, Color.white.opacity(0.7), tint.deepened(0.28).opacity(0.55)],
-                                       startPoint: .top, endPoint: .bottom),
-                        lineWidth: 1.2
-                    )
+                    ZStack {
+                        BubbleInsetShadow(shape: capsule, color: Color(red: 83/255, green: 79/255, blue: 91/255).opacity(0.20), x: 0, y: 5, blur: 8, spread: -5)
+                        BubbleInsetShadow(shape: capsule, color: Color.white.opacity(0.20), x: 0, y: 2, blur: 3)
+                        BubbleInsetShadow(shape: capsule, color: Color(red: 90/255, green: 86/255, blue: 95/255).opacity(0.055), x: 0, y: -1, blur: 2)
+                        BubbleInsetShadow(shape: capsule, color: Color.white.opacity(0.28), x: 0, y: 1, blur: 1)
+                    }
+                    .allowsHitTesting(false)
                 }
-                .overlay(alignment: .topLeading) { DropletHighlight() }
+                .overlay(alignment: mine ? .topLeading : .topTrailing) {
+                    DropletHighlight()
+                        .scaleEffect(x: mine ? 1 : -1, y: 1)
+                        .padding(mine ? .leading : .trailing, 10)
+                        .padding(.top, 5)
+                }
                 .compositingGroup()
-                .shadow(color: tint.deepened(0.32).opacity(0.38), radius: 2.5, y: 2.5)
-                .shadow(color: Color.black.opacity(0.07), radius: 7, y: 4)
+                .shadow(color: Color(red: 65/255, green: 62/255, blue: 70/255).opacity(0.18), radius: 1, y: 2)
+                .shadow(color: Color(red: 65/255, green: 62/255, blue: 70/255).opacity(0.065), radius: 2.5, y: 4)
         case .clay:
             let fill = Color(hexString: clayHex) ?? .white
-            let base = fill.deepened(0.07)
-            let capsule = RoundedRectangle(cornerRadius: 24, style: .continuous)
+            let rounded = RoundedRectangle(cornerRadius: 30, style: .continuous)
             content
                 .environment(\.colorScheme, .light)
-                .background {
+                .background { rounded.fill(fill) }
+                .overlay {
                     ZStack {
-                        // Thin, soft base just below the body (about 3-4pt visible).
-                        capsule.fill(base)
-                            .offset(y: 3.5)
-                            .blur(radius: 1.6)
-                        capsule.fill(fill)
-                        // Gentle shading towards the bottom edge; no top highlight.
-                        capsule.fill(LinearGradient(
-                            stops: [.init(color: base.opacity(0), location: 0.55),
-                                    .init(color: base.opacity(0.45), location: 1)],
-                            startPoint: .top, endPoint: .bottom
-                        ))
-                        // Puffy inner softness around the rim.
-                        capsule
-                            .stroke(Color.white.opacity(0.45), lineWidth: 4)
-                            .blur(radius: 3)
-                            .offset(y: 1.5)
-                            .clipShape(capsule)
+                        BubbleInsetShadow(shape: rounded, color: Color.black.opacity(0.12), x: -8, y: -8, blur: 16)
+                        BubbleInsetShadow(shape: rounded, color: Color.white.opacity(0.6), x: 8, y: 8, blur: 16)
                     }
+                    .allowsHitTesting(false)
                 }
-                .padding(.bottom, 3.5)
                 .compositingGroup()
-                .shadow(color: base.deepened(0.1).opacity(0.22), radius: 8, y: 4)
+                .shadow(color: Color(red: 90/255, green: 60/255, blue: 120/255).opacity(0.18), radius: 12, x: 10, y: 14)
         case .nativeGlass:
             content
                 .modifier(ToolbarMatchedGlass(shape: shape))
@@ -13334,16 +13435,12 @@ private extension View {
     @ViewBuilder
     func chatInitialBottomAnchor(followsSizeChanges: Bool = true) -> some View {
         if #available(iOS 18.0, *) {
-            if followsSizeChanges {
-                self
-                    .defaultScrollAnchor(.bottom, for: .initialOffset)
-                    .defaultScrollAnchor(.bottom, for: .sizeChanges)
-                    .defaultScrollAnchor(.bottom, for: .alignment)
-            } else {
-                self
-                    .defaultScrollAnchor(.bottom, for: .initialOffset)
-                    .defaultScrollAnchor(.bottom, for: .alignment)
-            }
+            // One modifier chain for both states: switching branches would rebuild the
+            // list and throw away its scroll position.
+            self
+                .defaultScrollAnchor(.bottom, for: .initialOffset)
+                .defaultScrollAnchor(followsSizeChanges ? .bottom : nil, for: .sizeChanges)
+                .defaultScrollAnchor(.bottom, for: .alignment)
         } else {
             self.defaultScrollAnchor(.bottom)
         }
