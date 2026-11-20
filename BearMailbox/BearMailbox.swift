@@ -7444,6 +7444,9 @@ struct AddedAIChatView: View {
                         .padding(.top, 10)
                         .padding(.bottom, 8)
                     }
+                    .contentMargins(.top, ChatChrome.topInset, for: .scrollContent)
+                    .contentMargins(.top, ChatChrome.topInset - 8, for: .scrollIndicators)
+                    .ignoresSafeArea(.container, edges: .top)
                     .opacity(initialScrollReady ? 1 : 0)
                     .allowsHitTesting(initialScrollReady)
                     .chatInitialBottomAnchor()
@@ -10423,7 +10426,8 @@ struct ChatView: View {
                         )
                         .equatable()
                         .padding(.horizontal, 14)
-                        .contentMargins(.top, geo.safeAreaInsets.top + 8, for: .scrollContent)
+                        .contentMargins(.top, ChatChrome.topInset, for: .scrollContent)
+                        .contentMargins(.top, ChatChrome.topInset - 8, for: .scrollIndicators)
                         .chatInitialBottomAnchor(followsSizeChanges: !isSystemSelecting)
                         .transparentTopScrollEdge()
                         .scrollDismissesKeyboard(.interactively)
@@ -14193,3 +14197,22 @@ private struct ChatBackgroundChoice: View {
 
 
 
+
+
+/// Height covered at the top of a chat screen: the status bar (window safe area) plus the
+/// floating navigation row (back button, name capsule, more button), plus a small gap.
+/// Read from the key window because chat scroll views extend under the top edge, where
+/// a GeometryReader reports a zero top inset.
+@MainActor
+enum ChatChrome {
+    static let navigationRow: CGFloat = 56
+    static let gap: CGFloat = 10
+    static var windowTopInset: CGFloat {
+        let windows = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap(\.windows)
+        let window = windows.first(where: \.isKeyWindow) ?? windows.first
+        return window?.safeAreaInsets.top ?? 59
+    }
+    static var topInset: CGFloat { windowTopInset + navigationRow + gap }
+}
